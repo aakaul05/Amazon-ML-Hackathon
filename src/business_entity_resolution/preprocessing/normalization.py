@@ -156,11 +156,12 @@ def normalize_source_df(df: pd.DataFrame, source_name: str = "") -> pd.DataFrame
     return df
 
 
-def load_normalized_or_compute(train_dir, repo_root):
+def load_normalized_or_compute(train_dir, repo_root, columns=None):
     """
     Loads pre-normalized Parquet cache if available.
     Falls back to raw TSV loading + normalization if cache is missing.
     """
+    import gc
     from pathlib import Path
     train_dir = Path(train_dir)
     repo_root = Path(repo_root)
@@ -172,17 +173,20 @@ def load_normalized_or_compute(train_dir, repo_root):
         cache_dir / "s3_normalized.parquet",
     ]
 
+    # Default to lightweight columns needed for matching/blocking
+    if columns is None:
+        columns = ["entity_id", "name_norm", "name_clean_legal", "address_norm", "country_norm"]
+
     if all(f.exists() for f in cache_files):
-        print("Loading pre-normalized Parquet cache (fast path)...")
-        s1 = pd.read_parquet(cache_files[0])
-        s2 = pd.read_parquet(cache_files[1])
-        s3 = pd.read_parquet(cache_files[2])
+        print(f"Loading pre-normalized Parquet cache (columns={len(columns)})...")
+        s1 = pd.read_parquet(cache_files[0], columns=columns)
+        s2 = pd.read_parquet(cache_files[1], columns=columns)
+        s3 = pd.read_parquet(cache_files[2], columns=columns)
         return s1, s2, s3
 
     # Fallback: load raw, normalize one-by-one and persist to cache to prevent OOM
     print("Cache not found. Normalizing one-by-one to Parquet cache (low-memory mode)...")
     cache_dir.mkdir(parents=True, exist_ok=True)
-    import gc
 
     cols = ["entity_id", "business_name", "business_address", "country"]
     for src_file, parquet_file, name in [
@@ -201,8 +205,9 @@ def load_normalized_or_compute(train_dir, repo_root):
             del df
             gc.collect()
 
-    print("Loading normalized Parquet files into memory...")
-    s1 = pd.read_parquet(cache_files[0])
-    s2 = pd.read_parquet(cache_files[1])
-    s3 = pd.read_parquet(cache_files[2])
+    print(f"Loading normalized Parquet files into memory (columns={len(columns)})...")
+    gc.collect()
+    s1 = pd.read_parquet(cache_files[0], columns=columns)
+    s2 = pd.read_parquet(cache_files[1], columns=columns)
+    s3 = pd.read_parquet(cache_files[2], columns=columns)
     return s1, s2, s3

@@ -3,7 +3,7 @@ scripts/06_candidate_generation.py
 ===================================
 Business Entity Resolution — Task 6: Candidate Generation / Blocking
 
-Multi-Pass Blocking System:
+Multi-Pass Blocking System (Low-Memory Optimized):
 1. Block 1: Exact Normalized Name (`name_norm`)
 2. Block 2: Exact Clean Legal Name (`name_clean_legal`)
 3. Block 3: Informative / Rare Name Tokens (DF thresholded)
@@ -16,21 +16,15 @@ Outputs:
 - data/student_resource/outputs/blocking/blocking_statistics.csv
 """
 
+from collections import defaultdict
 import gc
 import os
-import re
 import sys
 import time
-from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
 
-import numpy as np
 import pandas as pd
-from scipy.sparse import csr_matrix
-from sklearn.feature_extraction.text import TfidfVectorizer
-
-from sparse_dot_topn import awesome_cossim_topn
 
 # Reconfigure stdout for UTF-8 line buffering on Windows
 if hasattr(sys.stdout, "reconfigure"):
@@ -98,46 +92,35 @@ print(f"Dataset Dir: {TRAIN_DIR}")
 print(f"Output Dir : {OUTPUT_DIR}\n")
 
 
-def load_and_normalize_all():
-    print("Loading normalized datasets...")
-    s1, s2, s3 = load_normalized_or_compute(TRAIN_DIR, REPO_ROOT)
+def parse_ground_truth():
+    print("Parsing Ground Truth (streaming mode)...")
+    gt_path = TRAIN_DIR / "train_ground_truth.tsv"
 
-    gt = pd.read_csv(
-        TRAIN_DIR / "train_ground_truth.tsv",
-        sep="\t",
-        usecols=["source1_entity_id", "matched_entity_ids"],
-        dtype=str,
-    )
+    gt_dict_s2 = defaultdict(set)
+    gt_dict_s3 = defaultdict(set)
+    len_gt_s2 = 0
+    len_gt_s3 = 0
 
-    # Ground truth parsing
-    print("Parsing Ground Truth...")
-    gt["matched_entity_ids"] = gt["matched_entity_ids"].fillna("")
-    gt["matched_id"] = gt["matched_entity_ids"].str.split(",")
-    exploded = gt.explode("matched_id", ignore_index=True)
-    exploded["matched_id"] = exploded["matched_id"].str.strip()
-    exploded = exploded[exploded["matched_id"] != ""].copy()
-    exploded = exploded.rename(columns={"source1_entity_id": "s1_id", "matched_id": "other_id"})
+    with open(gt_path, "r", encoding="utf-8") as f:
+        header = f.readline()
+        for line in f:
+            parts = line.rstrip("\r\n").split("\t")
+            if len(parts) < 2:
+                continue
+            s1_id = parts[0].strip()
+            matched_str = parts[1].strip()
+            if not s1_id or not matched_str:
+                continue
+            for m in matched_str.split(","):
+                m_id = m.strip()
+                if m_id.startswith("S2-"):
+                    gt_dict_s2[s1_id].add(m_id)
+                    len_gt_s2 += 1
+                elif m_id.startswith("S3-"):
+                    gt_dict_s3[s1_id].add(m_id)
+                    len_gt_s3 += 1
 
-    gt_s2 = exploded[exploded["other_id"].str.startswith("S2-")].copy()
-    gt_s3 = exploded[exploded["other_id"].str.startswith("S3-")].copy()
-
-    gt_dict_s2 = gt_s2.groupby("s1_id")["other_id"].apply(set).to_dict()
-    gt_dict_s3 = gt_s3.groupby("s1_id")["other_id"].apply(set).to_dict()
-
-    return s1, s2, s3, gt_dict_s2, gt_dict_s3, len(gt_s2), len(gt_s3)
-
-    stats = {
-        "source": source_name,
-        "total_candidates": total_candidates,
-        "total_tp_recovered": total_tp,
-        "total_true_pairs": total_true_pairs,
-        "candidate_recall": union_recall,
-        "complete_s1_coverage_pct": full_cov_pct,
-        "zero_s1_coverage_pct": zero_cov_pct,
-        "reduction_ratio": reduction_ratio,
-    }
-
-    return cand_df, stats
+    return gt_dict_s2, gt_dict_s3, len_gt_s2, len_gt_s3
 
 
 # ============================================================
@@ -145,12 +128,17 @@ def load_and_normalize_all():
 # ============================================================
 
 def main():
-    s1, s2, s3, gt_s2, gt_s3, len_gt_s2, len_gt_s3 = load_and_normalize_all()
+    # Load ground truth once
+    gt_dict_s2, gt_dict_s3, len_gt_s2, len_gt_s3 = parse_ground_truth()
+
+    cols_needed = ["entity_id", "name_norm", "name_clean_legal", "address_norm"]
 
     # --- SOURCE 2 BLOCKING ---
     print("\n" + "=" * 70)
-    print("GENERATING BLOCKING PASSES FOR SOURCE 2")
+    print("LOADING SOURCE 1 & SOURCE 2 FOR BLOCKING")
     print("=" * 70)
+    s1, s2, _ = load_normalized_or_compute(TRAIN_DIR, REPO_ROOT, columns=cols_needed)
+
     b1_s2 = block_exact_field(s1, s2, "name_norm", "exact_name_norm")
     b2_s2 = block_exact_field(s1, s2, "name_clean_legal", "exact_clean_legal")
     b3_s2 = block_rare_tokens(s1, s2, max_df=500, max_cand_per_s1=50)
@@ -158,21 +146,23 @@ def main():
     b5_s2 = block_tfidf_char_ngram(s1, s2, min_sim=0.70, top_k=10, sample_limit=300000)
 
     cand_s2_df, stats_s2 = combine_blocks_and_evaluate(
-        s1, s2, gt_s2, len_gt_s2, [b1_s2, b2_s2, b3_s2, b4_s2, b5_s2], "Source 2"
+        s1, s2, gt_dict_s2, len_gt_s2, [b1_s2, b2_s2, b3_s2, b4_s2, b5_s2], "Source 2"
     )
 
-    # Save S2 Parquet
     out_s2_path = OUTPUT_DIR / "s1_s2_candidates.parquet"
     cand_s2_df.to_parquet(out_s2_path, index=False)
     print(f"Saved: {out_s2_path}")
 
-    del b1_s2, b2_s2, b3_s2, b4_s2, b5_s2, cand_s2_df
+    # Explicit memory cleanup before Source 3
+    del s2, b1_s2, b2_s2, b3_s2, b4_s2, b5_s2, cand_s2_df
     gc.collect()
 
     # --- SOURCE 3 BLOCKING ---
     print("\n" + "=" * 70)
-    print("GENERATING BLOCKING PASSES FOR SOURCE 3")
+    print("LOADING SOURCE 3 FOR BLOCKING")
     print("=" * 70)
+    _, _, s3 = load_normalized_or_compute(TRAIN_DIR, REPO_ROOT, columns=cols_needed)
+
     b1_s3 = block_exact_field(s1, s3, "name_norm", "exact_name_norm")
     b2_s3 = block_exact_field(s1, s3, "name_clean_legal", "exact_clean_legal")
     b3_s3 = block_rare_tokens(s1, s3, max_df=500, max_cand_per_s1=50)
@@ -180,15 +170,14 @@ def main():
     b5_s3 = block_tfidf_char_ngram(s1, s3, min_sim=0.70, top_k=10, sample_limit=300000)
 
     cand_s3_df, stats_s3 = combine_blocks_and_evaluate(
-        s1, s3, gt_s3, len_gt_s3, [b1_s3, b2_s3, b3_s3, b4_s3, b5_s3], "Source 3"
+        s1, s3, gt_dict_s3, len_gt_s3, [b1_s3, b2_s3, b3_s3, b4_s3, b5_s3], "Source 3"
     )
 
-    # Save S3 Parquet
     out_s3_path = OUTPUT_DIR / "s1_s3_candidates.parquet"
     cand_s3_df.to_parquet(out_s3_path, index=False)
     print(f"Saved: {out_s3_path}")
 
-    del b1_s3, b2_s3, b3_s3, b4_s3, b5_s3, cand_s3_df
+    del s1, s3, b1_s3, b2_s3, b3_s3, b4_s3, b5_s3, cand_s3_df
     gc.collect()
 
     # Save Blocking Statistics CSV

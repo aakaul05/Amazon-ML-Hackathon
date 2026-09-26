@@ -1,9 +1,10 @@
 """
 business_entity_resolution.blocking.candidate_generator
 ========================================================
-High-performance candidate generation and blocking algorithms for entity resolution.
+High-performance, memory-efficient candidate generation and blocking algorithms.
 """
 
+import gc
 import time
 from collections import Counter, defaultdict
 from typing import Dict, List, Set, Tuple
@@ -19,23 +20,27 @@ def block_exact_field(
     other_df: pd.DataFrame,
     field: str,
     block_name: str,
-) -> List[Tuple[str, str, str]]:
+) -> pd.DataFrame:
     """
     Exact string equality blocking pass on specified column field via vectorized merge.
+    Returns lightweight 2-column DataFrame [s1_entity_id, candidate_entity_id].
     """
     t0 = time.time()
     s1_valid = s1_df[s1_df[field] != ""][["entity_id", field]]
     other_valid = other_df[other_df[field] != ""][["entity_id", field]]
 
     merged = s1_valid.merge(other_valid, on=field, suffixes=("_s1", "_other"))
-    pairs = [
-        (r.entity_id_s1, r.entity_id_other, block_name)
-        for r in merged.itertuples(index=False)
-    ]
+    cand_df = merged[["entity_id_s1", "entity_id_other"]].rename(
+        columns={"entity_id_s1": "s1_entity_id", "entity_id_other": "candidate_entity_id"}
+    )
+    cand_df["block"] = block_name
+
+    del merged, s1_valid, other_valid
+    gc.collect()
 
     dt = time.time() - t0
-    print(f"[{block_name}] Generated {len(pairs):,} candidate pairs ({dt:.1f}s)")
-    return pairs
+    print(f"[{block_name}] Generated {len(cand_df):,} candidate pairs ({dt:.1f}s)")
+    return cand_df
 
 
 def block_rare_tokens(
@@ -43,7 +48,7 @@ def block_rare_tokens(
     other_df: pd.DataFrame,
     max_df: int = 500,
     max_cand_per_s1: int = 50,
-) -> List[Tuple[str, str, str]]:
+) -> pd.DataFrame:
     """
     Informative Token Blocking:
     Indexes rare/informative tokens in `name_norm` below document frequency threshold `max_df`.
@@ -60,6 +65,7 @@ def block_rare_tokens(
 
     # Filter rare informative tokens (DF <= max_df and length >= 3)
     valid_tokens = {t for t, count in token_counts.items() if 1 <= count <= max_df and len(t) >= 3}
+    del token_counts
 
     # Build inverted index for other
     inverted_index = defaultdict(list)
@@ -68,7 +74,8 @@ def block_rare_tokens(
             if token in valid_tokens:
                 inverted_index[token].append(ot_id)
 
-    pairs = []
+    s1_ids_list = []
+    ot_ids_list = []
     s1_names = s1_df[s1_df["name_norm"] != ""]
     for s1_id, name in zip(s1_names["entity_id"], s1_names["name_norm"]):
         cand_set = set()
@@ -78,17 +85,27 @@ def block_rare_tokens(
                 if len(cand_set) >= max_cand_per_s1:
                     break
         for ot_id in list(cand_set)[:max_cand_per_s1]:
-            pairs.append((s1_id, ot_id, block_name))
+            s1_ids_list.append(s1_id)
+            ot_ids_list.append(ot_id)
+
+    del inverted_index, valid_tokens
+    gc.collect()
+
+    cand_df = pd.DataFrame({
+        "s1_entity_id": s1_ids_list,
+        "candidate_entity_id": ot_ids_list,
+        "block": block_name
+    })
 
     dt = time.time() - t0
-    print(f"[{block_name}] Generated {len(pairs):,} candidate pairs (DF <= {max_df}, {dt:.1f}s)")
-    return pairs
+    print(f"[{block_name}] Generated {len(cand_df):,} candidate pairs (DF <= {max_df}, {dt:.1f}s)")
+    return cand_df
 
 
 def block_address_tokens(
     s1_df: pd.DataFrame,
     other_df: pd.DataFrame,
-) -> List[Tuple[str, str, str]]:
+) -> pd.DataFrame:
     """
     Address Component Blocking:
     Extracts house/building numbers, postal codes, and distinctive address tokens.
@@ -112,6 +129,7 @@ def block_address_tokens(
 
     # Keep informative address keys (DF <= 1000)
     valid_keys = {k for k, count in key_counts.items() if 1 <= count <= 1000}
+    del key_counts
 
     inverted_index = defaultdict(list)
     for ot_id, addr in zip(other_addrs["entity_id"], other_addrs["address_norm"]):
@@ -119,7 +137,8 @@ def block_address_tokens(
             if k in valid_keys:
                 inverted_index[k].append(ot_id)
 
-    pairs = []
+    s1_ids_list = []
+    ot_ids_list = []
     s1_addrs = s1_df[s1_df["address_norm"] != ""]
     for s1_id, addr in zip(s1_addrs["entity_id"], s1_addrs["address_norm"]):
         cands = set()
@@ -137,11 +156,21 @@ def block_address_tokens(
                 cands = set(inverted_index[k])
 
         for ot_id in list(cands)[:30]:
-            pairs.append((s1_id, ot_id, block_name))
+            s1_ids_list.append(s1_id)
+            ot_ids_list.append(ot_id)
+
+    del inverted_index, valid_keys
+    gc.collect()
+
+    cand_df = pd.DataFrame({
+        "s1_entity_id": s1_ids_list,
+        "candidate_entity_id": ot_ids_list,
+        "block": block_name
+    })
 
     dt = time.time() - t0
-    print(f"[{block_name}] Generated {len(pairs):,} candidate pairs ({dt:.1f}s)")
-    return pairs
+    print(f"[{block_name}] Generated {len(cand_df):,} candidate pairs ({dt:.1f}s)")
+    return cand_df
 
 
 def block_tfidf_char_ngram(
@@ -150,7 +179,7 @@ def block_tfidf_char_ngram(
     min_sim: float = 0.70,
     top_k: int = 10,
     sample_limit: int = 200000,
-) -> List[Tuple[str, str, str]]:
+) -> pd.DataFrame:
     """
     TF-IDF Character 3-gram Nearest Neighbor Retrieval:
     Captures character-level typos and spelling mutations with C++ sparse_dot_topn.
@@ -158,11 +187,9 @@ def block_tfidf_char_ngram(
     t0 = time.time()
     block_name = "char_ngram"
 
-    # Filter non-empty names
     s1_valid = s1_df[s1_df["name_clean_legal"] != ""].copy()
     other_valid = other_df[other_df["name_clean_legal"] != ""].copy()
 
-    # Apply sampling for performance if dataset exceeds limit
     if len(s1_valid) > sample_limit:
         s1_sub = s1_valid.head(sample_limit)
     else:
@@ -173,15 +200,15 @@ def block_tfidf_char_ngram(
     else:
         other_sub = other_valid
 
-    # Fit TfidfVectorizer on char 3-grams
     vectorizer = TfidfVectorizer(analyzer="char", ngram_range=(3, 3), min_df=2)
     corpus = pd.concat([s1_sub["name_clean_legal"], other_sub["name_clean_legal"]])
     vectorizer.fit(corpus)
 
     X_s1 = vectorizer.transform(s1_sub["name_clean_legal"])
     X_other = vectorizer.transform(other_sub["name_clean_legal"])
+    del corpus, vectorizer
+    gc.collect()
 
-    # High-performance C++ sparse matrix multiplication with top-n filtering
     top_sim = awesome_cossim_topn(
         X_s1,
         X_other.T,
@@ -190,19 +217,25 @@ def block_tfidf_char_ngram(
         use_threads=True,
         n_jobs=4,
     )
+    del X_s1, X_other
+    gc.collect()
 
     coo = top_sim.tocoo()
     s1_ids = s1_sub["entity_id"].values
     other_ids = other_sub["entity_id"].values
 
-    pairs = [
-        (s1_ids[r], other_ids[c], block_name)
-        for r, c in zip(coo.row, coo.col)
-    ]
+    cand_df = pd.DataFrame({
+        "s1_entity_id": s1_ids[coo.row],
+        "candidate_entity_id": other_ids[coo.col],
+        "block": block_name
+    })
+
+    del top_sim, coo, s1_ids, other_ids, s1_valid, other_valid, s1_sub, other_sub
+    gc.collect()
 
     dt = time.time() - t0
-    print(f"[{block_name}] Generated {len(pairs):,} candidate pairs (sim >= {min_sim}, {dt:.1f}s)")
-    return pairs
+    print(f"[{block_name}] Generated {len(cand_df):,} candidate pairs (sim >= {min_sim}, {dt:.1f}s)")
+    return cand_df
 
 
 def combine_blocks_and_evaluate(
@@ -210,65 +243,46 @@ def combine_blocks_and_evaluate(
     other_df: pd.DataFrame,
     gt_dict: Dict[str, Set[str]],
     total_true_pairs: int,
-    all_blocks: List[List[Tuple[str, str, str]]],
+    block_dfs: List[pd.DataFrame],
     source_name: str,
 ) -> Tuple[pd.DataFrame, Dict[str, float]]:
     """
     Combines candidates from multiple blocking passes, annotates pass provenance,
-    and calculates comprehensive retrieval recall and coverage metrics.
+    and calculates comprehensive retrieval recall and coverage metrics with minimal memory footprint.
     """
     print("\n" + "=" * 70)
     print(f"EVALUATING BLOCKING PASSES & UNION FOR {source_name}")
     print("=" * 70)
 
-    # Evaluate individual block recall & count
-    block_pair_sets: Dict[str, Set[Tuple[str, str]]] = {}
-
-    for block_list in all_blocks:
-        if not block_list:
+    for bdf in block_dfs:
+        if bdf.empty:
             continue
-        bname = block_list[0][2]
-        pair_set = {(r[0], r[1]) for r in block_list}
-        block_pair_sets[bname] = pair_set
-
+        bname = bdf["block"].iloc[0]
+        pair_set = set(zip(bdf["s1_entity_id"], bdf["candidate_entity_id"]))
         tp = sum(1 for s1_id, ot_id in pair_set if s1_id in gt_dict and ot_id in gt_dict[s1_id])
         recall = tp / total_true_pairs if total_true_pairs > 0 else 0.0
         avg_cand = len(pair_set) / len(s1_df)
 
         print(f"  {bname:<25s} | Recall: {recall*100:6.2f}% ({tp:>9,} TP) | Candidates: {len(pair_set):>10,} (avg {avg_cand:.2f}/S1)")
 
-    # Union all blocks into a candidate DataFrame
-    all_pairs = []
-    for block_list in all_blocks:
-        if block_list:
-            all_pairs.append(pd.DataFrame(block_list, columns=["s1_entity_id", "candidate_entity_id", "block"]))
-
-    if not all_pairs:
+    # Concatenate all block DataFrames
+    valid_dfs = [df for df in block_dfs if not df.empty]
+    if not valid_dfs:
         cand_df = pd.DataFrame(columns=["s1_entity_id", "candidate_entity_id", "blocking_passes"])
     else:
-        raw = pd.concat(all_pairs, ignore_index=True)
+        raw = pd.concat(valid_dfs, ignore_index=True)
         cand_df = (
             raw.groupby(["s1_entity_id", "candidate_entity_id"])["block"]
             .agg(lambda x: "|".join(sorted(set(x))))
             .reset_index()
             .rename(columns={"block": "blocking_passes"})
         )
+        del raw
+        gc.collect()
 
     total_candidates = len(cand_df)
 
-    # Unique contribution
-    print("\nBlock Unique Contributions (True Pairs recovered ONLY by this block):")
-    print("-" * 65)
-    for bname, pset in block_pair_sets.items():
-        other_sets = [s for name, s in block_pair_sets.items() if name != bname]
-        if other_sets:
-            unique_to_b = pset - set().union(*other_sets)
-        else:
-            unique_to_b = pset
-        tp_unique = sum(1 for s1_id, ot_id in unique_to_b if s1_id in gt_dict and ot_id in gt_dict[s1_id])
-        print(f"  {bname:<25s} | Unique TP Recovered: {tp_unique:>7,}")
-
-    # Overall Union Evaluation
+    # Union Evaluation
     all_cand_pairs = set(zip(cand_df["s1_entity_id"], cand_df["candidate_entity_id"]))
     total_tp = sum(1 for (s1_id, ot_id) in all_cand_pairs if s1_id in gt_dict and ot_id in gt_dict[s1_id])
     union_recall = total_tp / total_true_pairs if total_true_pairs > 0 else 0.0
