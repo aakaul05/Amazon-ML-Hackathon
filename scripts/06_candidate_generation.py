@@ -141,7 +141,7 @@ def main():
 
     b1_s2 = block_exact_field(s1, s2, "name_norm", "exact_name_norm")
     b2_s2 = block_exact_field(s1, s2, "name_clean_legal", "exact_clean_legal")
-    b3_s2 = block_rare_tokens(s1, s2, max_df=500, max_cand_per_s1=50)
+    b3_s2 = block_rare_tokens(s1, s2, max_df=300, max_cand_per_s1=30)
     b4_s2 = block_address_tokens(s1, s2)
     b5_s2 = block_tfidf_char_ngram(s1, s2, min_sim=0.70, top_k=10, sample_limit=300000)
 
@@ -165,7 +165,7 @@ def main():
 
     b1_s3 = block_exact_field(s1, s3, "name_norm", "exact_name_norm")
     b2_s3 = block_exact_field(s1, s3, "name_clean_legal", "exact_clean_legal")
-    b3_s3 = block_rare_tokens(s1, s3, max_df=500, max_cand_per_s1=50)
+    b3_s3 = block_rare_tokens(s1, s3, max_df=300, max_cand_per_s1=30)
     b4_s3 = block_address_tokens(s1, s3)
     b5_s3 = block_tfidf_char_ngram(s1, s3, min_sim=0.70, top_k=10, sample_limit=300000)
 
