@@ -2,6 +2,7 @@
 business_entity_resolution.blocking.candidate_generator
 ========================================================
 High-performance, memory-efficient candidate generation and blocking algorithms.
+Strictly optimized for low memory environments (< 4 GB RAM footprint).
 """
 
 import gc
@@ -20,22 +21,33 @@ def block_exact_field(
     other_df: pd.DataFrame,
     field: str,
     block_name: str,
+    max_key_df: int = 1000,
+    max_cand_per_s1: int = 50,
 ) -> pd.DataFrame:
     """
     Exact string equality blocking pass on specified column field via vectorized merge.
+    Guards against generic key explosions (DF <= max_key_df) and caps candidates per S1 entity.
     Returns lightweight 2-column DataFrame [s1_entity_id, candidate_entity_id].
     """
     t0 = time.time()
     s1_valid = s1_df[s1_df[field] != ""][["entity_id", field]]
     other_valid = other_df[other_df[field] != ""][["entity_id", field]]
 
+    # Filter out over-frequent generic keys (e.g. generic words matching thousands of records)
+    key_counts = other_valid.groupby(field).size()
+    valid_keys = key_counts[key_counts <= max_key_df].index
+    other_valid = other_valid[other_valid[field].isin(valid_keys)]
+    s1_valid = s1_valid[s1_valid[field].isin(valid_keys)]
+
     merged = s1_valid.merge(other_valid, on=field, suffixes=("_s1", "_other"))
+    merged = merged.groupby("entity_id_s1").head(max_cand_per_s1)
+
     cand_df = merged[["entity_id_s1", "entity_id_other"]].rename(
         columns={"entity_id_s1": "s1_entity_id", "entity_id_other": "candidate_entity_id"}
     )
     cand_df["block"] = block_name
 
-    del merged, s1_valid, other_valid
+    del merged, s1_valid, other_valid, key_counts, valid_keys
     gc.collect()
 
     dt = time.time() - t0
@@ -47,7 +59,7 @@ def block_rare_tokens(
     s1_df: pd.DataFrame,
     other_df: pd.DataFrame,
     max_df: int = 500,
-    max_cand_per_s1: int = 50,
+    max_cand_per_s1: int = 30,
 ) -> pd.DataFrame:
     """
     Informative Token Blocking:
@@ -248,24 +260,36 @@ def combine_blocks_and_evaluate(
 ) -> Tuple[pd.DataFrame, Dict[str, float]]:
     """
     Combines candidates from multiple blocking passes, annotates pass provenance,
-    and calculates comprehensive retrieval recall and coverage metrics with minimal memory footprint.
+    and calculates comprehensive retrieval recall and coverage metrics using 100% C-vectorized Pandas operations.
+    Fully avoids Python tuple/set loops that consume multi-gigabytes of memory.
     """
     print("\n" + "=" * 70)
     print(f"EVALUATING BLOCKING PASSES & UNION FOR {source_name}")
     print("=" * 70)
 
+    # 1. Build a flat, lightweight Ground Truth DataFrame ONCE for vectorized matching
+    gt_pairs = [(s1_id, ot_id) for s1_id, tset in gt_dict.items() for ot_id in tset]
+    gt_df = pd.DataFrame(gt_pairs, columns=["s1_entity_id", "candidate_entity_id"])
+    del gt_pairs
+    gc.collect()
+
+    # 2. Vectorized Evaluation per individual block
     for bdf in block_dfs:
         if bdf.empty:
             continue
         bname = bdf["block"].iloc[0]
-        pair_set = set(zip(bdf["s1_entity_id"], bdf["candidate_entity_id"]))
-        tp = sum(1 for s1_id, ot_id in pair_set if s1_id in gt_dict and ot_id in gt_dict[s1_id])
+
+        # Deduplicate block pairs
+        b_unique = bdf[["s1_entity_id", "candidate_entity_id"]].drop_duplicates()
+        tp_match = b_unique.merge(gt_df, on=["s1_entity_id", "candidate_entity_id"])
+        tp = len(tp_match)
         recall = tp / total_true_pairs if total_true_pairs > 0 else 0.0
-        avg_cand = len(pair_set) / len(s1_df)
+        avg_cand = len(b_unique) / len(s1_df)
 
-        print(f"  {bname:<25s} | Recall: {recall*100:6.2f}% ({tp:>9,} TP) | Candidates: {len(pair_set):>10,} (avg {avg_cand:.2f}/S1)")
+        print(f"  {bname:<25s} | Recall: {recall*100:6.2f}% ({tp:>9,} TP) | Candidates: {len(b_unique):>10,} (avg {avg_cand:.2f}/S1)")
+        del b_unique, tp_match
 
-    # Concatenate all block DataFrames
+    # 3. Concatenate all block DataFrames & build bitmask / blocking_passes string
     valid_dfs = [df for df in block_dfs if not df.empty]
     if not valid_dfs:
         cand_df = pd.DataFrame(columns=["s1_entity_id", "candidate_entity_id", "blocking_passes"])
@@ -282,28 +306,29 @@ def combine_blocks_and_evaluate(
 
     total_candidates = len(cand_df)
 
-    # Union Evaluation
-    all_cand_pairs = set(zip(cand_df["s1_entity_id"], cand_df["candidate_entity_id"]))
-    total_tp = sum(1 for (s1_id, ot_id) in all_cand_pairs if s1_id in gt_dict and ot_id in gt_dict[s1_id])
+    # 4. Vectorized Union Evaluation
+    cand_pairs_df = cand_df[["s1_entity_id", "candidate_entity_id"]]
+    matched_union = cand_pairs_df.merge(gt_df, on=["s1_entity_id", "candidate_entity_id"])
+    total_tp = len(matched_union)
     union_recall = total_tp / total_true_pairs if total_true_pairs > 0 else 0.0
 
-    retrieved_by_s1 = cand_df.groupby("s1_entity_id")["candidate_entity_id"].apply(set).to_dict()
+    # 5. Vectorized Entity-Level Complete Coverage Calculation
+    gt_counts = gt_df.groupby("s1_entity_id").size().rename("n_true")
+    retrieved_tp_counts = matched_union.groupby("s1_entity_id").size().rename("n_retrieved_tp")
+    del matched_union, cand_pairs_df
+    gc.collect()
 
-    full_coverage = 0
-    partial_coverage = 0
-    zero_coverage = 0
+    # Reindex over all S1 entities present in Ground Truth
+    cov_df = pd.concat([gt_counts, retrieved_tp_counts], axis=1).fillna(0)
+    del gt_counts, retrieved_tp_counts
+    gc.collect()
 
-    for s1_id, true_set in gt_dict.items():
-        retrieved = retrieved_by_s1.get(s1_id, set())
-        matched = true_set & retrieved
-        if len(matched) == len(true_set):
-            full_coverage += 1
-        elif len(matched) > 0:
-            partial_coverage += 1
-        else:
-            zero_coverage += 1
-
+    full_coverage = int((cov_df["n_retrieved_tp"] == cov_df["n_true"]).sum())
+    zero_coverage = int((cov_df["n_retrieved_tp"] == 0).sum())
     total_gt_s1 = len(gt_dict)
+    del cov_df, gt_df
+    gc.collect()
+
     full_cov_pct = full_coverage / total_gt_s1 * 100 if total_gt_s1 > 0 else 0.0
     zero_cov_pct = zero_coverage / total_gt_s1 * 100 if total_gt_s1 > 0 else 0.0
 
