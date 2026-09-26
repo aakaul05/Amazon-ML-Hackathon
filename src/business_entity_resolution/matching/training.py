@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union, Sequence
 import numpy as np
 import pandas as pd
+# pyrefly: ignore [missing-import]
 from catboost import CatBoostClassifier, Pool
 
 from business_entity_resolution.matching.features import FEATURE_NAMES
@@ -35,7 +36,7 @@ def entity_level_split(
     Tuple[Set[str], Set[str]]
         (train_s1_ids, val_s1_ids) sets.
     """
-    unique_s1 = list(set(s1_ids))
+    unique_s1 = np.unique(s1_ids).tolist()
     rng = np.random.RandomState(seed)
     rng.shuffle(unique_s1)
     split_idx = int(len(unique_s1) * (1.0 - val_fraction))
