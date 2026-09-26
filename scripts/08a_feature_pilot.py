@@ -23,6 +23,7 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
+from sklearn.model_selection import KFold
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -35,7 +36,6 @@ from business_entity_resolution.matching import (
     FEATURE_NAMES,
     compute_features_batch,
     label_candidates_batch,
-    entity_level_split,
     train_catboost_matcher,
     get_feature_importances,
 )
@@ -424,110 +424,141 @@ def run_pilot_for_source(
     print(f"Labels: {pos:,} positives ({pos/len(labels)*100:.2f}%), {neg:,} negatives")
 
     # ---------------------------------------------------------
-    # Step 6: Entity-level train/val split (80/20 of S1 entities)
+    # Step 6: 5-Fold Entity-Level Cross-Validation
     # ---------------------------------------------------------
 
-    print("\nEntity-level train/val split (80/20)...")
-    train_s1, val_s1 = entity_level_split(list(selected_s1), val_fraction=0.20, seed=42)
+    print("\nSetting up 5-Fold Entity-Level Cross-Validation...")
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    selected_s1_sorted = np.array(sorted(list(selected_s1)))
 
-    train_mask = np.fromiter((eid in train_s1 for eid in s1_eids), dtype=bool, count=len(s1_eids))
-    val_mask = ~train_mask
+    oof_probs = np.zeros(n_pairs, dtype=np.float32)
+    feature_importances_list = []
 
-    X_train, y_train = features[train_mask], labels[train_mask]
-    X_val, y_val = features[val_mask], labels[val_mask]
+    print(f"Starting 5-fold training and out-of-fold inference...")
 
-    print(f"Train: {len(X_train):,} pairs ({int(np.sum(y_train)):,} pos)")
-    print(f"Val  : {len(X_val):,} pairs ({int(np.sum(y_val)):,} pos)")
+    for fold, (train_idx, val_idx) in enumerate(kf.split(selected_s1_sorted), 1):
+        t_fold = time.time()
+        fold_train_s1 = set(selected_s1_sorted[train_idx])
+        fold_val_s1 = set(selected_s1_sorted[val_idx])
+
+        train_mask = np.fromiter((eid in fold_train_s1 for eid in s1_eids), dtype=bool, count=n_pairs)
+        val_mask = np.fromiter((eid in fold_val_s1 for eid in s1_eids), dtype=bool, count=n_pairs)
+
+        X_tr, y_tr = features[train_mask], labels[train_mask]
+        X_va, y_va = features[val_mask], labels[val_mask]
+
+        print(f"\n--- Fold {fold}/5 ---")
+        print(f"Train entities: {len(fold_train_s1):,} ({len(X_tr):,} pairs, {int(np.sum(y_tr)):,} pos)")
+        print(f"Val entities  : {len(fold_val_s1):,} ({len(X_va):,} pairs, {int(np.sum(y_va)):,} pos)")
+
+        model_path = OUTPUT_DIR / f"catboost_pilot_{target_name}_fold{fold}.cbm"
+        model, metrics = train_catboost_matcher(
+            X_train=X_tr, y_train=y_tr,
+            X_val=X_va, y_val=y_va,
+            iterations=1000, learning_rate=0.08, depth=7,
+            thread_count=8, model_save_path=model_path, verbose=200,
+            random_seed=42 + fold,
+        )
+
+        val_p = model.predict_proba(X_va)[:, 1]
+        oof_probs[val_mask] = val_p
+
+        fi_df = get_feature_importances(model, FEATURE_NAMES)
+        feature_importances_list.append(fi_df)
+
+        print(f"Fold {fold} finished in {time.time() - t_fold:.1f}s (best iter: {metrics['best_iteration']})")
+        del model, X_tr, y_tr, X_va, y_va, train_mask, val_mask
+        gc.collect()
+
+    # Average feature importances across all 5 folds
+    mean_fi = pd.concat(feature_importances_list).groupby("feature", as_index=False)["importance"].mean()
+    mean_fi = mean_fi.sort_values(by="importance", ascending=False).reset_index(drop=True)
+    print("\nTop 15 Mean Feature Importances Across 5 Folds:")
+    print(mean_fi.head(15).to_string(index=False))
+    mean_fi.to_csv(OUTPUT_DIR / f"feature_importance_{target_name}.csv", index=False)
 
     # ---------------------------------------------------------
-    # Step 7: Train CatBoost
+    # Step 7: Threshold sweep on Out-Of-Fold (OOF) predictions
     # ---------------------------------------------------------
 
-    print("\nTraining CatBoost...")
-    t0 = time.time()
-    model_path = OUTPUT_DIR / f"catboost_pilot_{target_name}.cbm"
-    model, metrics = train_catboost_matcher(
-        X_train=X_train, y_train=y_train,
-        X_val=X_val, y_val=y_val,
-        iterations=1000, learning_rate=0.08, depth=7,
-        thread_count=8, model_save_path=model_path, verbose=100,
-    )
-    print(f"Training: {time.time() - t0:.1f}s, best iter: {metrics['best_iteration']}")
-
-    # Feature importance
-    df_fi = get_feature_importances(model, FEATURE_NAMES)
-    print("\nTop 15 Feature Importances:")
-    print(df_fi.head(15).to_string(index=False))
-    df_fi.to_csv(OUTPUT_DIR / f"feature_importance_{target_name}.csv", index=False)
-
-    # ---------------------------------------------------------
-    # Step 8: Threshold sweep on VALIDATION entities
-    #         using CONDITIONAL ground truth (in-candidates only)
-    # ---------------------------------------------------------
-
-    print("\nSweeping thresholds (conditional on candidates)...")
-    val_probs = model.predict_proba(X_val)[:, 1]
-
-    val_s1_arr = s1_eids[val_mask]
-    val_cand_arr = cand_eids[val_mask]
-
-    # Build GT-in-candidates dict restricted to val S1 entities
-    val_gt_in_cand: Dict[str, Set[str]] = {}
-    for s1_id in val_s1:
-        val_gt_in_cand[s1_id] = gt_in_candidates.get(s1_id, set())
-
+    print("\nSweeping thresholds on 5-Fold OOF predictions...")
     sweep_df, best_th = entity_sweep_thresholds(
-        s1_ids=val_s1_arr,
-        candidate_ids=val_cand_arr,
-        probabilities=val_probs,
-        gt_in_candidates_by_s1=val_gt_in_cand,
-        eval_s1_ids=val_s1,
+        s1_ids=s1_eids,
+        candidate_ids=cand_eids,
+        probabilities=oof_probs,
+        gt_in_candidates_by_s1=gt_in_candidates,
+        eval_s1_ids=selected_s1,
     )
 
-    print("\nThreshold Sweep (Conditional on Candidates):")
+    print("\nThreshold Sweep (OOF Conditional on Candidates):")
     print(sweep_df.to_string(index=False))
     sweep_df.to_csv(OUTPUT_DIR / f"threshold_sweep_{target_name}.csv", index=False)
 
     # ---------------------------------------------------------
-    # Step 9: Detailed metrics at best threshold
+    # Step 8: Per-fold metrics evaluation at best OOF threshold
+    # ---------------------------------------------------------
+
+    fold_precisions = []
+    fold_recalls = []
+    fold_f05s = []
+
+    for fold, (train_idx, val_idx) in enumerate(kf.split(selected_s1_sorted), 1):
+        fold_val_s1 = set(selected_s1_sorted[val_idx])
+        fold_val_mask = np.fromiter((eid in fold_val_s1 for eid in s1_eids), dtype=bool, count=n_pairs)
+
+        f_df, _ = entity_sweep_thresholds(
+            s1_ids=s1_eids[fold_val_mask],
+            candidate_ids=cand_eids[fold_val_mask],
+            probabilities=oof_probs[fold_val_mask],
+            gt_in_candidates_by_s1=gt_in_candidates,
+            eval_s1_ids=fold_val_s1,
+            thresholds=[best_th],
+        )
+        row = f_df.iloc[0]
+        fold_precisions.append(row["macro_precision"])
+        fold_recalls.append(row["cond_macro_recall"])
+        fold_f05s.append(row["cond_macro_f05"])
+
+    # ---------------------------------------------------------
+    # Step 9: Detailed overall OOF metrics at best threshold
     # ---------------------------------------------------------
 
     best_row = sweep_df.loc[sweep_df["threshold"] == best_th].iloc[0]
 
     # Count matcher TP/FP/FN at best threshold
-    pred_mask = val_probs >= best_th
-    pred_pairs = set(zip(val_s1_arr[pred_mask], val_cand_arr[pred_mask]))
+    pred_mask = oof_probs >= best_th
+    pred_pairs = set(zip(s1_eids[pred_mask], cand_eids[pred_mask]))
 
-    val_gt_pair_set = set()
-    for s1_id in val_s1:
+    all_gt_in_cand_set = set()
+    for s1_id in selected_s1:
         for mid in gt_in_candidates.get(s1_id, set()):
-            val_gt_pair_set.add((s1_id, mid))
+            all_gt_in_cand_set.add((s1_id, mid))
 
-    val_full_gt_pairs = set()
-    for s1_id in val_s1:
+    all_gt_set = set()
+    for s1_id in selected_s1:
         for mid in gt_for_selected.get(s1_id, set()):
-            val_full_gt_pairs.add((s1_id, mid))
+            all_gt_set.add((s1_id, mid))
 
-    matcher_tp = len(pred_pairs & val_gt_pair_set)
-    matcher_fp = len(pred_pairs - val_gt_pair_set)
-    matcher_fn = len(val_gt_pair_set - pred_pairs)
-    blocking_fn_val = len(val_full_gt_pairs) - len(val_gt_pair_set)
+    matcher_tp = len(pred_pairs & all_gt_in_cand_set)
+    matcher_fp = len(pred_pairs - all_gt_in_cand_set)
+    matcher_fn = len(all_gt_in_cand_set - pred_pairs)
+    blocking_fn_total = len(all_gt_set) - len(all_gt_in_cand_set)
 
-    cond_recall = matcher_tp / len(val_gt_pair_set) if len(val_gt_pair_set) > 0 else 0.0
-    e2e_recall = matcher_tp / len(val_full_gt_pairs) if len(val_full_gt_pairs) > 0 else 0.0
+    cond_recall = matcher_tp / len(all_gt_in_cand_set) if len(all_gt_in_cand_set) > 0 else 0.0
+    e2e_recall = matcher_tp / len(all_gt_set) if len(all_gt_set) > 0 else 0.0
     pair_precision = matcher_tp / (matcher_tp + matcher_fp) if (matcher_tp + matcher_fp) > 0 else 0.0
 
     print("\n" + "=" * 70)
-    print(f"PILOT RESULTS: S1 -> {target_name.upper()}")
+    print(f"5-FOLD CV PILOT RESULTS: S1 -> {target_name.upper()}")
     print("=" * 70)
-    print(f"  S1 entities evaluated  : {len(val_s1):,}")
-    print(f"  Val candidate pairs    : {len(X_val):,}")
-    print(f"  Val GT pairs (total)   : {len(val_full_gt_pairs):,}")
-    print(f"  Val GT pairs in cands  : {len(val_gt_pair_set):,}")
-    print(f"  Blocking FN (val)      : {blocking_fn_val:,}")
-    print(f"  Blocking recall (val)  : {len(val_gt_pair_set)/len(val_full_gt_pairs)*100:.2f}%" if len(val_full_gt_pairs) > 0 else "  Blocking recall: N/A")
+    print(f"  S1 entities evaluated  : {len(selected_s1):,}")
+    print(f"  Total candidate pairs  : {len(cand_df):,}")
+    print(f"  Total GT pairs        : {len(all_gt_set):,}")
+    print(f"  GT pairs in cands     : {len(all_gt_in_cand_set):,}")
+    print(f"  Blocking FN            : {blocking_fn_total:,}")
+    print(f"  Blocking recall        : {len(all_gt_in_cand_set)/len(all_gt_set)*100:.2f}%" if len(all_gt_set) > 0 else "  Blocking recall: N/A")
     print(f"  ---")
-    print(f"  Best threshold         : {best_th:.2f}")
+    print(f"  Best OOF threshold     : {best_th:.2f}")
     print(f"  Predicted pairs        : {int(best_row['predicted_pairs']):,}")
     print(f"  Matcher TP             : {matcher_tp:,}")
     print(f"  Matcher FP             : {matcher_fp:,}")
@@ -536,13 +567,13 @@ def run_pilot_for_source(
     print(f"  Pair precision         : {pair_precision:.4f}")
     print(f"  Cond. matcher recall   : {cond_recall:.4f} ({cond_recall*100:.2f}%)")
     print(f"  End-to-end recall      : {e2e_recall:.4f} ({e2e_recall*100:.2f}%)")
-    print(f"  Macro precision        : {best_row['macro_precision']:.4f}")
-    print(f"  Cond. macro recall     : {best_row['cond_macro_recall']:.4f}")
-    print(f"  Cond. macro F0.5       : {best_row['cond_macro_f05']:.4f}")
+    print(f"  Macro precision        : {np.mean(fold_precisions):.4f} ± {np.std(fold_precisions):.4f}")
+    print(f"  Cond. macro recall     : {np.mean(fold_recalls):.4f} ± {np.std(fold_recalls):.4f}")
+    print(f"  Cond. macro F0.5       : {np.mean(fold_f05s):.4f} ± {np.std(fold_f05s):.4f}")
     print("=" * 70)
 
     # Cleanup
-    del cand_df, features, labels, X_train, y_train, X_val, y_val, val_probs
+    del cand_df, features, labels, oof_probs
     gc.collect()
 
 
