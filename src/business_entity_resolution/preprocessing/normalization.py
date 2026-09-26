@@ -179,17 +179,30 @@ def load_normalized_or_compute(train_dir, repo_root):
         s3 = pd.read_parquet(cache_files[2])
         return s1, s2, s3
 
-    # Fallback: load raw + normalize
-    print("Cache not found. Loading raw TSVs and normalizing...")
+    # Fallback: load raw, normalize one-by-one and persist to cache to prevent OOM
+    print("Cache not found. Normalizing one-by-one to Parquet cache (low-memory mode)...")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    import gc
+
     cols = ["entity_id", "business_name", "business_address", "country"]
-    s1 = pd.read_csv(train_dir / "train_source1.tsv", sep="\t", usecols=cols, dtype=str)
-    s2 = pd.read_csv(train_dir / "train_source2.tsv", sep="\t", usecols=cols, dtype=str)
-    s3 = pd.read_csv(train_dir / "train_source3.tsv", sep="\t", usecols=cols, dtype=str)
+    for src_file, parquet_file, name in [
+        ("train_source1.tsv", cache_files[0], "S1"),
+        ("train_source2.tsv", cache_files[1], "S2"),
+        ("train_source3.tsv", cache_files[2], "S3"),
+    ]:
+        if not parquet_file.exists():
+            print(f"  Loading & Normalizing {name} ({src_file})...")
+            df = pd.read_csv(train_dir / src_file, sep="\t", usecols=cols, dtype=str)
+            df["name_norm"], df["name_clean_legal"] = normalize_series_fast(df["business_name"], is_name=True)
+            df["address_norm"], _ = normalize_series_fast(df["business_address"], is_name=False)
+            df["country_norm"], _ = normalize_series_fast(df["country"], is_name=False)
+            df.to_parquet(parquet_file, index=False)
+            print(f"  Saved {name} cache -> {parquet_file}")
+            del df
+            gc.collect()
 
-    for name, df in [("S1", s1), ("S2", s2), ("S3", s3)]:
-        print(f"  Normalizing {name}...")
-        df["name_norm"], df["name_clean_legal"] = normalize_series_fast(df["business_name"], is_name=True)
-        df["address_norm"], _ = normalize_series_fast(df["business_address"], is_name=False)
-        df["country_norm"], _ = normalize_series_fast(df["country"], is_name=False)
-
+    print("Loading normalized Parquet files into memory...")
+    s1 = pd.read_parquet(cache_files[0])
+    s2 = pd.read_parquet(cache_files[1])
+    s3 = pd.read_parquet(cache_files[2])
     return s1, s2, s3

@@ -253,6 +253,9 @@ def main():
         top_s2["Rule"] = rule_name
         ambiguous_diagnostics.append(top_s2)
 
+        del idx_s2, idx_s3, preds_s2, preds_s3, preds_all
+        gc.collect()
+
     # 6. Save Results
     results_df = pd.DataFrame(results)
     results_csv = OUTPUT_DIR / "deterministic_baseline_results.csv"
