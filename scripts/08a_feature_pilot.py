@@ -1,8 +1,8 @@
-
 """
 Script 08a: Feature Engineering & Model Training Pilot (Task 8A).
 
 Runs an end-to-end matching pipeline on a ~2M pair sample per source to validate:
+
 - Feature computation correctness & performance
 - Label alignment with ground truth
 - CatBoost training dynamics & AUC
@@ -14,21 +14,22 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Set
 
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = REPO_ROOT / "src"
+
 sys.path.insert(0, str(SRC_DIR))
+
 
 from business_entity_resolution.matching import (
     FEATURE_NAMES,
     compute_features_batch,
-    load_ground_truth_dict,
-    load_ground_truth_pairs,
     label_candidates_batch,
     entity_level_split,
     train_catboost_matcher,
@@ -48,8 +49,18 @@ def find_dataset_dir() -> Path:
         return Path(p)
 
     candidates = [
-        REPO_ROOT / "dataset" / "student_resource" / "dataset" / "train",
-        REPO_ROOT / "data" / "student_resource" / "dataset" / "train",
+        REPO_ROOT
+        / "dataset"
+        / "student_resource"
+        / "dataset"
+        / "train",
+
+        REPO_ROOT
+        / "data"
+        / "student_resource"
+        / "dataset"
+        / "train",
+
         Path.home()
         / "Amazon-ML-Hackathon"
         / "dataset"
@@ -73,8 +84,17 @@ def find_dataset_dir() -> Path:
 
 def find_blocking_dir() -> Path:
     candidates = [
-        REPO_ROOT / "data" / "student_resource" / "outputs" / "blocking",
-        REPO_ROOT / "data" / "outputs" / "blocking",
+        REPO_ROOT
+        / "data"
+        / "student_resource"
+        / "outputs"
+        / "blocking",
+
+        REPO_ROOT
+        / "data"
+        / "outputs"
+        / "blocking",
+
         Path.home()
         / "Amazon-ML-Hackathon"
         / "data"
@@ -108,11 +128,85 @@ OUTPUT_DIR = (
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def load_ground_truth(
+    gt_file_path: Path,
+) -> Tuple[Dict[str, Set[str]], Set[Tuple[str, str]], Set[Tuple[str, str]]]:
+    """
+    Loads ground truth using the actual competition schema:
+
+        source1_entity_id    matched_entity_ids
+
+    Returns:
+        gt_dict:
+            S1 entity ID -> set of all matched S2/S3 entity IDs
+
+        gt_pairs_s2:
+            Set of (S1, S2) positive pairs
+
+        gt_pairs_s3:
+            Set of (S1, S3) positive pairs
+    """
+
+    df = pd.read_csv(
+        gt_file_path,
+        sep="\t",
+        dtype={
+            "source1_entity_id": str,
+            "matched_entity_ids": str,
+        },
+        usecols=[
+            "source1_entity_id",
+            "matched_entity_ids",
+        ],
+    )
+
+    gt_dict: Dict[str, Set[str]] = {}
+    gt_pairs_s2: Set[Tuple[str, str]] = set()
+    gt_pairs_s3: Set[Tuple[str, str]] = set()
+
+    for s1_id, matches in zip(
+        df["source1_entity_id"],
+        df["matched_entity_ids"],
+    ):
+        if pd.isna(matches) or not str(matches).strip():
+            gt_dict[str(s1_id)] = set()
+            continue
+
+        match_set = {
+            m.strip()
+            for m in str(matches).split(",")
+            if m.strip()
+        }
+
+        gt_dict[str(s1_id)] = match_set
+
+        for match_id in match_set:
+            if match_id.startswith("S2"):
+                gt_pairs_s2.add(
+                    (str(s1_id), match_id)
+                )
+
+            elif match_id.startswith("S3"):
+                gt_pairs_s3.add(
+                    (str(s1_id), match_id)
+                )
+
+    return gt_dict, gt_pairs_s2, gt_pairs_s3
+
+
 def build_lookup_table(
     df_norm: pd.DataFrame,
 ) -> Dict[str, Tuple[str, str, str, str]]:
-    """Build fast O(1) lookup:
-    entity_id -> (name_norm, name_clean_legal, address_norm, country_norm)
+    """
+    Build fast O(1) lookup:
+
+    entity_id ->
+        (
+            name_norm,
+            name_clean_legal,
+            address_norm,
+            country_norm
+        )
     """
 
     lookup = {}
@@ -139,25 +233,33 @@ def run_pilot_for_source(
     cand_path: Path,
     s1_lookup: Dict[str, Tuple[str, str, str, str]],
     target_lookup: Dict[str, Tuple[str, str, str, str]],
-    gt_pairs: set,
-    gt_dict: dict,
+    gt_pairs: Set[Tuple[str, str]],
+    gt_dict: Dict[str, Set[str]],
     sample_size: int = 2_000_000,
 ):
+
     print("=" * 70)
+
     print(
         f"PILOT MATCHING: S1 -> {target_name.upper()} "
         f"(Sample: {sample_size:,} candidate pairs)"
     )
+
     print("=" * 70)
 
     if not cand_path.is_file():
-        print(f"ERROR: Candidate file not found: {cand_path}")
+        print(
+            f"ERROR: Candidate file not found: {cand_path}"
+        )
         return
 
     # ---------------------------------------------------------
     # Read candidate sample
     # ---------------------------------------------------------
-    print(f"Reading candidate pairs from {cand_path.name}...")
+
+    print(
+        f"Reading candidate pairs from {cand_path.name}..."
+    )
 
     t0 = time.time()
 
@@ -177,10 +279,15 @@ def run_pilot_for_source(
         df_b = batch.to_pandas()
 
         batches.append(df_b)
+
         total_read += len(df_b)
 
         if total_read >= sample_size:
             break
+
+    if not batches:
+        print("ERROR: Candidate file contains no rows.")
+        return
 
     cand_df = pd.concat(
         batches,
@@ -198,7 +305,10 @@ def run_pilot_for_source(
     # ---------------------------------------------------------
     # Extract normalized attributes
     # ---------------------------------------------------------
-    print("Extracting normalized attributes for candidate pairs...")
+
+    print(
+        "Extracting normalized attributes for candidate pairs..."
+    )
 
     t0 = time.time()
 
@@ -219,6 +329,7 @@ def run_pilot_for_source(
     bp_list = cand_df["blocking_passes"].values
 
     for i in range(n_pairs):
+
         s1_id = s1_eids[i]
         cand_id = cand_eids[i]
 
@@ -243,12 +354,14 @@ def run_pilot_for_source(
             ) = ot_data
 
     print(
-        f"Extracted attributes in {time.time() - t0:.2f}s"
+        f"Extracted attributes in "
+        f"{time.time() - t0:.2f}s"
     )
 
     # ---------------------------------------------------------
     # Compute features
     # ---------------------------------------------------------
+
     print("Computing 18 pairwise features...")
 
     t0 = time.time()
@@ -266,14 +379,18 @@ def run_pilot_for_source(
     )
 
     print(
-        f"Computed features array of shape {features.shape} "
+        f"Computed features array of shape "
+        f"{features.shape} "
         f"in {time.time() - t0:.2f}s"
     )
 
     # ---------------------------------------------------------
     # Label candidates
     # ---------------------------------------------------------
-    print("Labeling pairs against ground truth...")
+
+    print(
+        "Labeling pairs against ground truth..."
+    )
 
     t0 = time.time()
 
@@ -301,6 +418,7 @@ def run_pilot_for_source(
     # ---------------------------------------------------------
     # Entity-level train/validation split
     # ---------------------------------------------------------
+
     print(
         "\nPerforming entity-level train/val split (80/20)..."
     )
@@ -337,7 +455,10 @@ def run_pilot_for_source(
     # ---------------------------------------------------------
     # Train CatBoost
     # ---------------------------------------------------------
-    print("\nTraining CatBoost Classifier...")
+
+    print(
+        "\nTraining CatBoost Classifier..."
+    )
 
     t0 = time.time()
 
@@ -360,19 +481,24 @@ def run_pilot_for_source(
     )
 
     print(
-        f"Training completed in {time.time() - t0:.2f}s. "
+        f"Training completed in "
+        f"{time.time() - t0:.2f}s. "
         f"Best iteration: {metrics['best_iteration']}"
     )
 
     # ---------------------------------------------------------
     # Feature importance
     # ---------------------------------------------------------
+
     df_fi = get_feature_importances(
         model,
         FEATURE_NAMES,
     )
 
-    print("\nTop 10 Most Important Features:")
+    print(
+        "\nTop 10 Most Important Features:"
+    )
+
     print(
         df_fi.head(10).to_string(index=False)
     )
@@ -386,12 +512,15 @@ def run_pilot_for_source(
     # ---------------------------------------------------------
     # Validation predictions + threshold sweep
     # ---------------------------------------------------------
+
     print(
         "\nEvaluating probabilities and sweeping "
         "decision thresholds for Macro F0.5..."
     )
 
-    val_probs = model.predict_proba(X_val)[:, 1]
+    val_probs = model.predict_proba(
+        X_val
+    )[:, 1]
 
     val_s1_eval = s1_eids[val_mask]
     val_cand_eval = cand_eids[val_mask]
@@ -404,7 +533,10 @@ def run_pilot_for_source(
         val_s1_ids=val_s1,
     )
 
-    print("\nThreshold Sweep Results:")
+    print(
+        "\nThreshold Sweep Results:"
+    )
+
     print(
         sweep_df.to_string(index=False)
     )
@@ -422,7 +554,8 @@ def run_pilot_for_source(
     print("=" * 70)
 
     print(
-        f"PILOT RESULTS FOR S1 -> {target_name.upper()}:"
+        f"PILOT RESULTS FOR S1 -> "
+        f"{target_name.upper()}:"
     )
 
     print(
@@ -451,7 +584,10 @@ def run_pilot_for_source(
 
     print("=" * 70)
 
+    # ---------------------------------------------------------
     # Free memory before next source
+    # ---------------------------------------------------------
+
     del cand_df
     del features
     del labels
@@ -459,22 +595,35 @@ def run_pilot_for_source(
     del y_train
     del X_val
     del y_val
+    del val_probs
 
     gc.collect()
 
 
 def main():
+
     train_dir = find_dataset_dir()
     blocking_dir = find_blocking_dir()
 
-    print(f"Train Dataset Dir: {train_dir}")
-    print(f"Blocking Outputs : {blocking_dir}")
-    print(f"Pilot Outputs    : {OUTPUT_DIR}")
+    print(
+        f"Train Dataset Dir: {train_dir}"
+    )
+
+    print(
+        f"Blocking Outputs : {blocking_dir}"
+    )
+
+    print(
+        f"Pilot Outputs    : {OUTPUT_DIR}"
+    )
 
     # ---------------------------------------------------------
     # Load existing normalized cache
     # ---------------------------------------------------------
-    print("\nLoading normalized cache...")
+
+    print(
+        "\nLoading normalized cache..."
+    )
 
     columns = [
         "entity_id",
@@ -486,22 +635,38 @@ def main():
 
     # IMPORTANT:
     # load_normalized_or_compute() returns ALL THREE dataframes.
+    #
     # Pass REPO_ROOT so it looks in:
+    #
     # data/outputs/normalized_cache/
-    s1_norm, s2_norm, s3_norm = load_normalized_or_compute(
-        train_dir,
-        REPO_ROOT,
-        columns=columns,
+
+    s1_norm, s2_norm, s3_norm = (
+        load_normalized_or_compute(
+            train_dir,
+            REPO_ROOT,
+            columns=columns,
+        )
     )
 
-    print("Building lookup dictionaries...")
+    print(
+        "Building lookup dictionaries..."
+    )
 
-    s1_lookup = build_lookup_table(s1_norm)
-    s2_lookup = build_lookup_table(s2_norm)
-    s3_lookup = build_lookup_table(s3_norm)
+    s1_lookup = build_lookup_table(
+        s1_norm
+    )
 
-    # We no longer need the normalized DataFrames after
-    # creating the lookup dictionaries.
+    s2_lookup = build_lookup_table(
+        s2_norm
+    )
+
+    s3_lookup = build_lookup_table(
+        s3_norm
+    )
+
+    # We no longer need the normalized
+    # DataFrames after creating lookup dictionaries.
+
     del s1_norm
     del s2_norm
     del s3_norm
@@ -511,9 +676,14 @@ def main():
     # ---------------------------------------------------------
     # Load ground truth
     # ---------------------------------------------------------
-    gt_file = train_dir / "train_ground_truth.tsv"
+
+    gt_file = (
+        train_dir
+        / "train_ground_truth.tsv"
+    )
 
     if not gt_file.is_file():
+
         alt_gt = (
             REPO_ROOT
             / "dataset"
@@ -526,30 +696,24 @@ def main():
         if alt_gt.is_file():
             gt_file = alt_gt
 
-    print(f"Loading ground truth from {gt_file}...")
-
-    gt_dict = load_ground_truth_dict(
-        gt_file
+    print(
+        f"Loading ground truth from {gt_file}..."
     )
 
-    gt_pairs_s2 = load_ground_truth_pairs(
-        gt_file,
-        target_prefix="S2",
-    )
-
-    gt_pairs_s3 = load_ground_truth_pairs(
-        gt_file,
-        target_prefix="S3",
+    gt_dict, gt_pairs_s2, gt_pairs_s3 = (
+        load_ground_truth(gt_file)
     )
 
     print(
-        f"Loaded {len(gt_pairs_s2):,} S2 positive pairs "
-        f"and {len(gt_pairs_s3):,} S3 positive pairs."
+        f"Loaded {len(gt_pairs_s2):,} S2 "
+        f"positive pairs and "
+        f"{len(gt_pairs_s3):,} S3 positive pairs."
     )
 
     # ---------------------------------------------------------
     # Run pilot for S2
     # ---------------------------------------------------------
+
     s2_cand_file = (
         blocking_dir
         / "s1_s2_candidates.parquet"
@@ -570,6 +734,7 @@ def main():
     # ---------------------------------------------------------
     # Run pilot for S3
     # ---------------------------------------------------------
+
     s3_cand_file = (
         blocking_dir
         / "s1_s3_candidates.parquet"
