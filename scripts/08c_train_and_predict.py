@@ -20,6 +20,7 @@ from typing import Dict, List, Set, Tuple
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
+from sklearn.model_selection import KFold
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = REPO_ROOT / "src"
@@ -28,7 +29,6 @@ sys.path.insert(0, str(SRC_DIR))
 from business_entity_resolution.matching import (
     FEATURE_NAMES,
     load_ground_truth_dict,
-    entity_level_split,
     train_catboost_matcher,
     get_feature_importances,
     sweep_thresholds,
@@ -160,78 +160,115 @@ def main():
     feature_dirs = [d for d in [s2_features_dir, s3_features_dir] if d.exists()]
     s1_ids, cand_ids, X, y = collect_training_samples(feature_dirs)
 
-    # 2. Entity-level train/val split
-    print("\nSplitting unique S1 entities into Train (80%) and Val (20%)...")
-    train_s1, val_s1 = entity_level_split(s1_ids, val_fraction=0.20, seed=42)
-    train_mask = np.fromiter((eid in train_s1 for eid in s1_ids), dtype=bool, count=len(s1_ids))
-    val_mask = ~train_mask
-
-    X_train, y_train = X[train_mask], y[train_mask]
-    X_val, y_val = X[val_mask], y[val_mask]
-
-    print(f"Train set: {len(X_train):,} pairs (Positives: {int(np.sum(y_train)):,})")
-    print(f"Val set  : {len(X_val):,} pairs (Positives: {int(np.sum(y_val)):,})")
-
-    # 3. Train CatBoost Model
+    # 2. 5-Fold Entity-Level Split & Training
     print("\n" + "=" * 75)
-    print("TRAINING CATBOOST MATCHER")
+    print("5-FOLD CROSS-VALIDATION & MODEL TRAINING")
     print("=" * 75)
-    t0 = time.time()
-    model_save_path = MODELS_DIR / "catboost_matcher_v1.cbm"
-    model, metrics = train_catboost_matcher(
-        X_train=X_train,
-        y_train=y_train,
-        X_val=X_val,
-        y_val=y_val,
-        iterations=2000,
-        learning_rate=0.06,
-        depth=8,
-        l2_leaf_reg=3.0,
-        thread_count=8,
-        model_save_path=model_save_path,
-        verbose=100,
-    )
-    print(f"Training completed in {(time.time() - t0)/60:.2f} mins.")
 
-    # Save feature importances
-    df_fi = get_feature_importances(model, FEATURE_NAMES)
-    print("\nFeature Importances:")
-    print(df_fi.to_string(index=False))
-    df_fi.to_csv(DIAG_DIR / "feature_importance_v1.csv", index=False)
+    unique_s1_sorted = np.array(sorted(list(set(s1_ids))))
+    print(f"Total sampled pool pairs: {len(s1_ids):,} across {len(unique_s1_sorted):,} unique S1 entities")
 
-    # 4. Sweep Thresholds on Validation S1 entities
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    oof_probs = np.zeros(len(s1_ids), dtype=np.float32)
+    models_list = []
+    feature_importances_list = []
+
+    for fold, (train_idx, val_idx) in enumerate(kf.split(unique_s1_sorted), 1):
+        t0 = time.time()
+        fold_train_s1 = set(unique_s1_sorted[train_idx])
+        fold_val_s1 = set(unique_s1_sorted[val_idx])
+
+        train_mask = np.fromiter((eid in fold_train_s1 for eid in s1_ids), dtype=bool, count=len(s1_ids))
+        val_mask = np.fromiter((eid in fold_val_s1 for eid in s1_ids), dtype=bool, count=len(s1_ids))
+
+        X_tr, y_tr = X[train_mask], y[train_mask]
+        X_va, y_va = X[val_mask], y[val_mask]
+
+        print(f"\n--- Fold {fold}/5 ---")
+        print(f"Train set: {len(X_tr):,} pairs (Positives: {int(np.sum(y_tr)):,})")
+        print(f"Val set  : {len(X_va):,} pairs (Positives: {int(np.sum(y_va)):,})")
+
+        model_save_path = MODELS_DIR / f"catboost_matcher_fold{fold}.cbm"
+        model, metrics = train_catboost_matcher(
+            X_train=X_tr,
+            y_train=y_tr,
+            X_val=X_va,
+            y_val=y_va,
+            iterations=2000,
+            learning_rate=0.06,
+            depth=8,
+            l2_leaf_reg=3.0,
+            thread_count=8,
+            model_save_path=model_save_path,
+            verbose=200,
+            random_seed=42 + fold,
+        )
+
+        val_p = model.predict_proba(X_va)[:, 1]
+        oof_probs[val_mask] = val_p
+        models_list.append(model)
+
+        fi_df = get_feature_importances(model, FEATURE_NAMES)
+        feature_importances_list.append(fi_df)
+
+        print(f"Fold {fold} training completed in {(time.time() - t0)/60:.2f} mins (best iter: {metrics['best_iteration']})")
+
+    # Save averaged feature importances across 5 folds
+    mean_fi = pd.concat(feature_importances_list).groupby("feature", as_index=False)["importance"].mean()
+    mean_fi = mean_fi.sort_values(by="importance", ascending=False).reset_index(drop=True)
+    print("\nMean Feature Importances Across 5 Folds:")
+    print(mean_fi.to_string(index=False))
+    mean_fi.to_csv(DIAG_DIR / "feature_importance_v1.csv", index=False)
+
+    # 3. Sweep Thresholds on OOF Predictions
     print("\n" + "=" * 75)
-    print("THRESHOLD OPTIMIZATION FOR MACRO F0.5")
+    print("THRESHOLD OPTIMIZATION ON 5-FOLD OOF PREDICTIONS")
     print("=" * 75)
-    val_probs = model.predict_proba(X_val)[:, 1]
-    val_s1_arr = s1_ids[val_mask]
-    val_cand_arr = cand_ids[val_mask]
 
     sweep_df, best_threshold = sweep_thresholds(
-        s1_ids=val_s1_arr,
-        candidate_ids=val_cand_arr,
-        probabilities=val_probs,
+        s1_ids=s1_ids,
+        candidate_ids=cand_ids,
+        probabilities=oof_probs,
         ground_truth_by_s1=gt_dict,
-        val_s1_ids=val_s1,
+        val_s1_ids=set(unique_s1_sorted),
     )
 
-    print("\nValidation Threshold Sweep Table:")
+    print("\nOOF Threshold Sweep Table:")
     print(sweep_df.to_string(index=False))
     sweep_df.to_csv(DIAG_DIR / "threshold_sweep_v1.csv", index=False)
 
     best_row = sweep_df.loc[sweep_df["threshold"] == best_threshold].iloc[0]
-    print(f"\nOPTIMAL THRESHOLD: {best_threshold:.2f}")
-    print(f"Validation Macro F0.5: {best_row['macro_f05']:.4f}")
-    print(f"Validation Macro P   : {best_row['macro_precision']:.4f}")
-    print(f"Validation Macro R   : {best_row['macro_recall']:.4f}")
 
-    # Free memory before inference
-    del X, y, X_train, y_train, X_val, y_val, val_probs
+    # Evaluate fold variation at best threshold
+    fold_precisions, fold_recalls, fold_f05s = [], [], []
+    for fold, (train_idx, val_idx) in enumerate(kf.split(unique_s1_sorted), 1):
+        fold_val_s1 = set(unique_s1_sorted[val_idx])
+        f_val_mask = np.fromiter((eid in fold_val_s1 for eid in s1_ids), dtype=bool, count=len(s1_ids))
+        f_df, _ = sweep_thresholds(
+            s1_ids=s1_ids[f_val_mask],
+            candidate_ids=cand_ids[f_val_mask],
+            probabilities=oof_probs[f_val_mask],
+            ground_truth_by_s1=gt_dict,
+            val_s1_ids=fold_val_s1,
+            thresholds=[best_threshold],
+        )
+        r = f_df.iloc[0]
+        fold_precisions.append(r["macro_precision"])
+        fold_recalls.append(r["macro_recall"])
+        fold_f05s.append(r["macro_f05"])
+
+    print(f"\nOPTIMAL OOF THRESHOLD: {best_threshold:.2f}")
+    print(f"OOF Validation Macro F0.5: {np.mean(fold_f05s):.4f} ± {np.std(fold_f05s):.4f}")
+    print(f"OOF Validation Macro P   : {np.mean(fold_precisions):.4f} ± {np.std(fold_precisions):.4f}")
+    print(f"OOF Validation Macro R   : {np.mean(fold_recalls):.4f} ± {np.std(fold_recalls):.4f}")
+
+    # Free sample arrays memory (keep models in models_list)
+    del X, y, oof_probs
     gc.collect()
 
-    # 5. Streaming Full Inference Across All Features
+    # 4. Streaming Full Inference Across All Features with 5-Fold Model Ensemble
     print("\n" + "=" * 75)
-    print(f"FULL INFERENCE ACROSS ALL CANDIDATES (Threshold = {best_threshold:.2f})")
+    print(f"FULL ENSEMBLE INFERENCE ACROSS ALL CANDIDATES (5 Models, Threshold = {best_threshold:.2f})")
     print("=" * 75)
 
     all_predictions_by_s1 = defaultdict(set)
@@ -241,7 +278,7 @@ def main():
             continue
 
         p_files = sorted(list(src_dir.glob("part_*.parquet")))
-        print(f"\nScoring {len(p_files)} feature chunks for {src_name.upper()}...")
+        print(f"\nScoring {len(p_files)} feature chunks for {src_name.upper()} with 5-fold ensemble...")
         t_src_start = time.time()
         matched_pairs_s1 = []
         matched_pairs_cand = []
@@ -250,7 +287,10 @@ def main():
         for p_idx, p_file in enumerate(p_files):
             df_part = pd.read_parquet(p_file)
             X_part = df_part[FEATURE_NAMES].values.astype(np.float32)
-            probs = model.predict_proba(X_part)[:, 1]
+
+            # Average probabilities across all 5 fold models
+            fold_probs = [m.predict_proba(X_part)[:, 1] for m in models_list]
+            probs = np.mean(fold_probs, axis=0)
 
             keep_mask = probs >= best_threshold
             if np.any(keep_mask):
@@ -278,7 +318,7 @@ def main():
         df_pred_src.to_parquet(pred_out_file, engine="pyarrow", compression="snappy", index=False)
         print(f"Saved {len(df_pred_src):,} {src_name.upper()} predictions to {pred_out_file.name} in {(time.time() - t_src_start)/60:.2f} mins")
 
-    # 6. Overall Full Dataset Macro F0.5 Evaluation
+    # 5. Overall Full Dataset Macro F0.5 Evaluation
     print("\n" + "=" * 75)
     print("FINAL FULL DATASET EVALUATION (Macro F0.5)")
     print("=" * 75)
@@ -296,7 +336,8 @@ def main():
 
     metrics_output = {
         "best_threshold": float(best_threshold),
-        "val_macro_f05": float(best_row["macro_f05"]),
+        "cv_val_macro_f05_mean": float(np.mean(fold_f05s)),
+        "cv_val_macro_f05_std": float(np.std(fold_f05s)),
         "full_macro_f05": float(final_metrics["macro_f05"]),
         "full_macro_precision": float(final_metrics["macro_precision"]),
         "full_macro_recall": float(final_metrics["macro_recall"]),

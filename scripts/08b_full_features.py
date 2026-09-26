@@ -211,9 +211,8 @@ def main():
     print(f"Feature Base Dir : {OUTPUT_BASE}")
 
     print("\nLoading normalized cache...")
-    s1_norm = load_normalized_or_compute(train_dir, "s1", columns=["entity_id", "name_norm", "name_clean_legal", "address_norm", "country_norm"])
-    s2_norm = load_normalized_or_compute(train_dir, "s2", columns=["entity_id", "name_norm", "name_clean_legal", "address_norm", "country_norm"])
-    s3_norm = load_normalized_or_compute(train_dir, "s3", columns=["entity_id", "name_norm", "name_clean_legal", "address_norm", "country_norm"])
+    cols = ["entity_id", "name_norm", "name_clean_legal", "address_norm", "country_norm"]
+    s1_norm, s2_norm, s3_norm = load_normalized_or_compute(train_dir, REPO_ROOT, columns=cols)
 
     print("Building lookup dictionaries...")
     s1_lookup = build_lookup_table(s1_norm)
