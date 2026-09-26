@@ -1,2 +1,20 @@
-data/student_resource/*
-!dataset/student/.gitkeep
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Data & outputs (large files)
+data/
+*.parquet
+*.csv.gz
+
+# Environment & IDE
+.env
+.venv
+env/
+venv/
+.vscode/

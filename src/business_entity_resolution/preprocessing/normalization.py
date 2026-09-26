@@ -136,3 +136,60 @@ def normalize_series_fast(series: pd.Series, is_name: bool = False) -> Tuple[pd.
         return basic_series, legal_series
     
     return basic_series, None
+
+
+def normalize_source_df(df: pd.DataFrame, source_name: str = "") -> pd.DataFrame:
+    """
+    Applies full name, address, and country normalization pipeline to a source DataFrame.
+    """
+    if source_name:
+        print(f"Normalizing {source_name}...")
+    df["name_norm"], df["name_clean_legal"] = normalize_series_fast(
+        df["business_name"], is_name=True
+    )
+    df["address_norm"], _ = normalize_series_fast(
+        df["business_address"], is_name=False
+    )
+    df["country_norm"], _ = normalize_series_fast(
+        df["country"], is_name=False
+    )
+    return df
+
+
+def load_normalized_or_compute(train_dir, repo_root):
+    """
+    Loads pre-normalized Parquet cache if available.
+    Falls back to raw TSV loading + normalization if cache is missing.
+    """
+    from pathlib import Path
+    train_dir = Path(train_dir)
+    repo_root = Path(repo_root)
+
+    cache_dir = repo_root / "data" / "outputs" / "normalized_cache"
+    cache_files = [
+        cache_dir / "s1_normalized.parquet",
+        cache_dir / "s2_normalized.parquet",
+        cache_dir / "s3_normalized.parquet",
+    ]
+
+    if all(f.exists() for f in cache_files):
+        print("Loading pre-normalized Parquet cache (fast path)...")
+        s1 = pd.read_parquet(cache_files[0])
+        s2 = pd.read_parquet(cache_files[1])
+        s3 = pd.read_parquet(cache_files[2])
+        return s1, s2, s3
+
+    # Fallback: load raw + normalize
+    print("Cache not found. Loading raw TSVs and normalizing...")
+    cols = ["entity_id", "business_name", "business_address", "country"]
+    s1 = pd.read_csv(train_dir / "train_source1.tsv", sep="\t", usecols=cols, dtype=str)
+    s2 = pd.read_csv(train_dir / "train_source2.tsv", sep="\t", usecols=cols, dtype=str)
+    s3 = pd.read_csv(train_dir / "train_source3.tsv", sep="\t", usecols=cols, dtype=str)
+
+    for name, df in [("S1", s1), ("S2", s2), ("S3", s3)]:
+        print(f"  Normalizing {name}...")
+        df["name_norm"], df["name_clean_legal"] = normalize_series_fast(df["business_name"], is_name=True)
+        df["address_norm"], _ = normalize_series_fast(df["business_address"], is_name=False)
+        df["country_norm"], _ = normalize_series_fast(df["country"], is_name=False)
+
+    return s1, s2, s3

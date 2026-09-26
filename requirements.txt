@@ -6,3 +6,5 @@ scikit-learn
 rapidfuzz
 catboost
 pyarrow
+sparse-dot-topn
+faiss-cpu

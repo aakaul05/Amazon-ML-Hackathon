@@ -547,6 +547,14 @@ def main():
     s2 = normalize_source_df(s2, "Source 2")
     s3 = normalize_source_df(s3, "Source 3")
 
+    # Save normalized data as Parquet cache for downstream scripts
+    cache_dir = REPO_ROOT / "data" / "outputs" / "normalized_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    s1.to_parquet(cache_dir / "s1_normalized.parquet", index=False)
+    s2.to_parquet(cache_dir / "s2_normalized.parquet", index=False)
+    s3.to_parquet(cache_dir / "s3_normalized.parquet", index=False)
+    print(f"\nSaved normalized Parquet cache to: {cache_dir}")
+
     # 3. Collision diagnostics
     run_collision_analysis(s1, "Source 1")
     run_collision_analysis(s2, "Source 2")
