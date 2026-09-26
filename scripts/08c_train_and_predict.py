@@ -163,7 +163,7 @@ def main():
     # 2. Entity-level train/val split
     print("\nSplitting unique S1 entities into Train (80%) and Val (20%)...")
     train_s1, val_s1 = entity_level_split(s1_ids, val_fraction=0.20, seed=42)
-    train_mask = np.isin(s1_ids, list(train_s1))
+    train_mask = np.fromiter((eid in train_s1 for eid in s1_ids), dtype=bool, count=len(s1_ids))
     val_mask = ~train_mask
 
     X_train, y_train = X[train_mask], y[train_mask]

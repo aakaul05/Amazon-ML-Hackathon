@@ -429,9 +429,10 @@ def run_pilot_for_source(
         seed=42,
     )
 
-    train_mask = np.isin(
-        s1_eids,
-        list(train_s1),
+    train_mask = np.fromiter(
+        (eid in train_s1 for eid in s1_eids),
+        dtype=bool,
+        count=len(s1_eids),
     )
 
     val_mask = ~train_mask

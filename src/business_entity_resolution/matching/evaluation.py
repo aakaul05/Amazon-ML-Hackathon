@@ -119,7 +119,7 @@ def sweep_thresholds(
         val_s1_ids = set(np.unique(s1_ids))
 
     # Filter pairs to validation S1 IDs
-    val_mask = np.isin(s1_ids, list(val_s1_ids)) if len(val_s1_ids) < len(np.unique(s1_ids)) else np.ones(len(s1_ids), dtype=bool)
+    val_mask = np.fromiter((eid in val_s1_ids for eid in s1_ids), dtype=bool, count=len(s1_ids)) if len(val_s1_ids) < len(set(s1_ids)) else np.ones(len(s1_ids), dtype=bool)
     sub_s1 = s1_ids[val_mask]
     sub_cand = candidate_ids[val_mask]
     sub_prob = probabilities[val_mask]

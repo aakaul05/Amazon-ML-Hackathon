@@ -35,12 +35,12 @@ def entity_level_split(
     Tuple[Set[str], Set[str]]
         (train_s1_ids, val_s1_ids) sets.
     """
-    unique_s1 = np.unique(s1_ids)
+    unique_s1 = list(set(s1_ids))
     rng = np.random.RandomState(seed)
-    shuffled = rng.permutation(unique_s1)
-    split_idx = int(len(shuffled) * (1.0 - val_fraction))
-    train_ids = set(shuffled[:split_idx])
-    val_ids = set(shuffled[split_idx:])
+    rng.shuffle(unique_s1)
+    split_idx = int(len(unique_s1) * (1.0 - val_fraction))
+    train_ids = set(unique_s1[:split_idx])
+    val_ids = set(unique_s1[split_idx:])
     return train_ids, val_ids
 
 
