@@ -18,7 +18,6 @@ from typing import Dict, Tuple, Set
 
 import numpy as np
 import pandas as pd
-import pyarrow.parquet as pq
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -254,7 +253,8 @@ def run_pilot_for_source(
         return
 
     # ---------------------------------------------------------
-    # Read candidate sample
+    # Read ALL candidates then random-sample
+    # (sequential first-N biases toward one blocking pass)
     # ---------------------------------------------------------
 
     print(
@@ -263,43 +263,36 @@ def run_pilot_for_source(
 
     t0 = time.time()
 
-    parquet_file = pq.ParquetFile(str(cand_path))
-
-    batches = []
-    total_read = 0
-
-    for batch in parquet_file.iter_batches(
-        batch_size=250_000,
+    cand_full = pd.read_parquet(
+        cand_path,
         columns=[
             "s1_entity_id",
             "candidate_entity_id",
             "blocking_passes",
         ],
-    ):
-        df_b = batch.to_pandas()
+    )
 
-        batches.append(df_b)
+    total_rows = len(cand_full)
 
-        total_read += len(df_b)
+    print(
+        f"Total candidates: {total_rows:,}. "
+        f"Sampling {min(sample_size, total_rows):,} randomly..."
+    )
 
-        if total_read >= sample_size:
-            break
-
-    if not batches:
-        print("ERROR: Candidate file contains no rows.")
-        return
-
-    cand_df = pd.concat(
-        batches,
-        ignore_index=True,
-    ).iloc[:sample_size]
+    if total_rows > sample_size:
+        cand_df = cand_full.sample(
+            n=sample_size,
+            random_state=42,
+        ).reset_index(drop=True)
+        del cand_full
+    else:
+        cand_df = cand_full
 
     print(
         f"Loaded {len(cand_df):,} candidate pairs "
         f"in {time.time() - t0:.2f}s"
     )
 
-    del batches
     gc.collect()
 
     # ---------------------------------------------------------
@@ -362,7 +355,7 @@ def run_pilot_for_source(
     # Compute features
     # ---------------------------------------------------------
 
-    print("Computing 18 pairwise features...")
+    print(f"Computing {len(FEATURE_NAMES)} pairwise features...")
 
     t0 = time.time()
 
