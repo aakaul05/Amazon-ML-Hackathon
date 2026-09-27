@@ -90,6 +90,9 @@ V3_BLOCK_BITMASK = {
     "name_prefix_plus_addr_num":    64,
     "phonetic":                    128,
     "partitioned_tfidf":           256,
+    "postal_prefix":               512,
+    "consonant_skeleton":         1024,
+    "street_rare_token":          2048,
 }
 
 
@@ -149,6 +152,22 @@ def build_s1_v3_profiles(df_s1: pd.DataFrame) -> Dict:
             if ph and len(ph) >= 3:
                 ph_keys.append(ph)
 
+        # Consonant skeleton prefix (vowel-stripped)
+        consonants = "".join(c for c in ncl_str if c.isalpha() and c not in "aeiou")
+        consonant_prefix = consonants[:6] if len(consonants) >= 4 else ""
+
+        # Postal code (5-6 digit) + 3-char compact name prefix
+        postal_codes = [t for t in nums if 5 <= len(t) <= 6]
+        postal_prefix_pairs = []
+        if postal_codes and len(compact) >= 3:
+            for pc in postal_codes[:2]:
+                postal_prefix_pairs.append(f"{pc}|{compact[:3]}")
+
+        # Distinctive street word + rarest name token
+        street_rare_token = []
+        if words and tokens_ncl_sorted:
+            street_rare_token.append(f"{words[0]}|{tokens_ncl_sorted[0]}")
+
         s1_profiles[eid] = {
             "entity_id": eid,
             "nn": nn_str,
@@ -161,6 +180,9 @@ def build_s1_v3_profiles(df_s1: pd.DataFrame) -> Dict:
             "addr_pairs": addr_pairs,
             "name_prefix_addr": name_prefix_addr,
             "phonetic": ph_keys,
+            "consonant_prefix": consonant_prefix,
+            "postal_prefix_pairs": postal_prefix_pairs,
+            "street_rare_token": street_rare_token,
         }
     print(f"Built profiles in {time.time() - t0:.1f}s")
     return s1_profiles
@@ -182,6 +204,9 @@ def stream_v3_inverted_index(
     s1_addr_pairs_set = {ap for p in s1_profiles.values() for ap in p["addr_pairs"]}
     s1_name_addr_set = {nap for p in s1_profiles.values() for nap in p["name_prefix_addr"]}
     s1_ph_set = {ph for p in s1_profiles.values() for ph in p["phonetic"]}
+    s1_consonant_set = {p["consonant_prefix"] for p in s1_profiles.values() if p["consonant_prefix"]}
+    s1_postal_prefix_set = {pp for p in s1_profiles.values() for pp in p["postal_prefix_pairs"]}
+    s1_street_rare_set = {sr for p in s1_profiles.values() for sr in p["street_rare_token"]}
     print(f"[{source_name}] Active keys built in {time.time() - t0:.1f}s")
 
     idx_exact_norm = defaultdict(list)
@@ -192,6 +217,9 @@ def stream_v3_inverted_index(
     idx_addr_pairs = defaultdict(list)
     idx_name_addr = defaultdict(list)
     idx_phonetic = defaultdict(list)
+    idx_consonant = defaultdict(list)
+    idx_postal_prefix = defaultdict(list)
+    idx_street_rare = defaultdict(list)
 
     pf = pq.ParquetFile(str(target_parquet_path))
     t0 = time.time()
@@ -216,6 +244,11 @@ def stream_v3_inverted_index(
             if compact[:8] in s1_compact_set:
                 idx_compact[compact[:8]].append(eid)
 
+            # Consonant skeleton
+            consonants = "".join(c for c in ncl_str if c.isalpha() and c not in "aeiou")
+            if consonants[:6] in s1_consonant_set:
+                idx_consonant[consonants[:6]].append(eid)
+
             nums, words = extract_address_components(an_str)
             if nums and words:
                 for num in nums[:2]:
@@ -230,11 +263,25 @@ def stream_v3_inverted_index(
                     if nap in s1_name_addr_set:
                         idx_name_addr[nap].append(eid)
 
+            # Postal code + 3-char prefix
+            postal_codes = [t for t in nums if 5 <= len(t) <= 6]
+            if postal_codes and len(compact) >= 3:
+                for pc in postal_codes[:2]:
+                    pp = f"{pc}|{compact[:3]}"
+                    if pp in s1_postal_prefix_set:
+                        idx_postal_prefix[pp].append(eid)
+
             tokens_ncl = [t for t in ncl_str.split() if len(t) >= 3 and t not in NAME_STOPWORDS]
             tokens_ncl_sorted = sorted(tokens_ncl, key=len, reverse=True)
             for t in tokens_ncl_sorted[:4]:
                 if t in s1_token_set:
                     idx_token[t].append(eid)
+
+            # Street + rarest token
+            if words and tokens_ncl_sorted:
+                sr = f"{words[0]}|{tokens_ncl_sorted[0]}"
+                if sr in s1_street_rare_set:
+                    idx_street_rare[sr].append(eid)
 
             if len(tokens_ncl_sorted) >= 2:
                 p1, p2 = sorted([tokens_ncl_sorted[0], tokens_ncl_sorted[1]])
@@ -263,6 +310,9 @@ def stream_v3_inverted_index(
         "name_prefix_plus_addr_num": defaultdict(set),
         "phonetic": defaultdict(set),
         "exact_name_norm": defaultdict(set),
+        "postal_prefix": defaultdict(set),
+        "consonant_skeleton": defaultdict(set),
+        "street_rare_token": defaultdict(set),
     }
 
     # 1. exact_clean_legal (DF <= 200, cap 30)
@@ -348,6 +398,38 @@ def stream_v3_inverted_index(
             cands = idx_exact_norm[k]
             if 0 < len(cands) <= 200:
                 blocker_pairs["exact_name_norm"][s1_id].update(sorted(cands)[:30])
+
+    # 9. postal_prefix (DF <= 25, top 15)
+    for s1_id, prof in s1_profiles.items():
+        cand_counts = Counter()
+        for pp in prof["postal_prefix_pairs"]:
+            if pp in idx_postal_prefix:
+                cands = idx_postal_prefix[pp]
+                if 0 < len(cands) <= 25:
+                    cand_counts.update(cands)
+        if cand_counts:
+            sorted_cands = sorted(cand_counts.keys(), key=lambda c: (-cand_counts[c], c))
+            blocker_pairs["postal_prefix"][s1_id].update(sorted_cands[:15])
+
+    # 10. consonant_skeleton (DF <= 150, top 15)
+    for s1_id, prof in s1_profiles.items():
+        cp = prof["consonant_prefix"]
+        if cp and cp in idx_consonant:
+            cands = idx_consonant[cp]
+            if 0 < len(cands) <= 150:
+                blocker_pairs["consonant_skeleton"][s1_id].update(sorted(cands)[:15])
+
+    # 11. street_rare_token (DF <= 30, top 15)
+    for s1_id, prof in s1_profiles.items():
+        cand_counts = Counter()
+        for sr in prof["street_rare_token"]:
+            if sr in idx_street_rare:
+                cands = idx_street_rare[sr]
+                if 0 < len(cands) <= 30:
+                    cand_counts.update(cands)
+        if cand_counts:
+            sorted_cands = sorted(cand_counts.keys(), key=lambda c: (-cand_counts[c], c))
+            blocker_pairs["street_rare_token"][s1_id].update(sorted_cands[:15])
 
     return blocker_pairs
 

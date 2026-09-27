@@ -21,6 +21,53 @@ def strip_accents_and_diacritics(text: str) -> str:
     return "".join(c for c in nfkd if unicodedata.category(c) != "Mn")
 
 
+DOMAIN_SUFFIX_PATTERN = re.compile(
+    r"\s+(?:com|org|net|co\s+in|in|biz|info)$",
+    flags=re.IGNORECASE
+)
+
+ADDRESS_CANONICAL_MAP = {
+    "rd": "road",
+    "st": "street",
+    "str": "street",
+    "ave": "avenue",
+    "av": "avenue",
+    "blvd": "boulevard",
+    "dr": "drive",
+    "ln": "lane",
+    "hwy": "highway",
+    "bldg": "building",
+    "fl": "floor",
+    "flr": "floor",
+    "ste": "suite",
+    "apt": "apartment",
+    "opp": "opposite",
+    "nr": "near",
+    "sec": "sector",
+    "blk": "block",
+    "dist": "district",
+}
+
+
+def strip_domain_artifacts(text: str) -> str:
+    """Strips website prefixes and top-level domain artifacts from business names."""
+    if not text:
+        return ""
+    text = re.sub(r"^(?:https?://)?(?:www\.)?", "", str(text).strip(), flags=re.IGNORECASE)
+    text = DOMAIN_SUFFIX_PATTERN.sub("", text).strip()
+    return text
+
+
+def canonicalize_address_string(text: str) -> str:
+    """Normalizes address abbreviations (rd -> road, st -> street) and ordinals (1st -> 1)."""
+    if not text:
+        return ""
+    tokens = text.split()
+    canonical = [ADDRESS_CANONICAL_MAP.get(t, t) for t in tokens]
+    canonical = [re.sub(r"^(\d+)(?:st|nd|rd|th)$", r"\1", t) for t in canonical]
+    return " ".join(canonical)
+
+
 def basic_clean_string(text: str) -> str:
     """
     1. Unicode accent decomposition (NFKD)

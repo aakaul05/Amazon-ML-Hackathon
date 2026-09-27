@@ -100,25 +100,42 @@ def load_s1_entity_metadata(test_dir: Path) -> Tuple[List[str], Dict[str, str]]:
     return s1_ids, country_map
 
 
-def load_matches_map(parquet_path: Path, target_name: str) -> Dict[str, List[str]]:
-    """Loads match predictions and groups them by s1_entity_id."""
+def load_matches_map(
+    parquet_path: Path,
+    target_name: str,
+    top_margin: float = 0.15,
+    max_matches: int = 4,
+) -> Dict[str, List[str]]:
+    """Loads match predictions and groups them by s1_entity_id with optional top-margin pruning."""
     if not parquet_path.is_file():
         print(f"WARNING: Match file {parquet_path} not found! Assuming 0 matches.")
         return {}
 
     print(f"Loading S1 -> {target_name.upper()} matches from {parquet_path.name}...")
     t0 = time.time()
-    df_m = pd.read_parquet(parquet_path, columns=["s1_entity_id", "matched_entity_id"])
+    cols_available = pq.ParquetFile(str(parquet_path)).schema.names
+    load_cols = ["s1_entity_id", "matched_entity_id", "probability"] if "probability" in cols_available else ["s1_entity_id", "matched_entity_id"]
+
+    df_m = pd.read_parquet(parquet_path, columns=load_cols)
     print(f"Loaded {len(df_m):,} match predictions in {time.time() - t0:.2f}s")
 
-    # Group by s1_entity_id
     matches_map = defaultdict(list)
-    s1_arr = df_m["s1_entity_id"].to_numpy()
-    cand_arr = df_m["matched_entity_id"].to_numpy()
-    for s1, m in zip(s1_arr, cand_arr):
-        matches_map[s1].append(m)
+    if "probability" in df_m.columns and top_margin is not None:
+        print(f"  Applying Top-Margin Pruning (gap <= {top_margin:.2f}, max_matches <= {max_matches})...")
+        df_m.sort_values(by=["s1_entity_id", "probability"], ascending=[True, False], inplace=True)
+        for s1, grp in df_m.groupby("s1_entity_id", sort=False):
+            probs = grp["probability"].values
+            cands = grp["matched_entity_id"].values
+            max_p = probs[0]
+            kept = [c for c, p in zip(cands, probs) if (max_p - p) <= top_margin][:max_matches]
+            matches_map[s1] = kept
+    else:
+        s1_arr = df_m["s1_entity_id"].to_numpy()
+        cand_arr = df_m["matched_entity_id"].to_numpy()
+        for s1, m in zip(s1_arr, cand_arr):
+            matches_map[s1].append(m)
 
-    del df_m, s1_arr, cand_arr
+    del df_m
     gc.collect()
     return matches_map
 
@@ -140,7 +157,6 @@ def stream_candidates_map(parquet_path: Path, target_name: str, chunk_size: int 
 
     for batch in p_file.iter_batches(batch_size=chunk_size, columns=["s1_entity_id", "candidate_entity_id"]):
         df_chunk = batch.to_pandas()
-        # Group candidates by s1 in chunk
         grouped = df_chunk.groupby("s1_entity_id")["candidate_entity_id"].apply(list)
         for s1, c_list in grouped.items():
             cand_map[s1].extend(c_list)
@@ -157,6 +173,12 @@ def stream_candidates_map(parquet_path: Path, target_name: str, chunk_size: int 
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Create Official Submission TSVs")
+    parser.add_argument("--top-margin", type=float, default=0.15, help="Top-margin gap for cluster pruning")
+    parser.add_argument("--max-matches", type=int, default=4, help="Maximum matches per entity")
+    args = parser.parse_args()
+
     start_time = time.time()
     print("=" * 75)
     print("STEP 4: CREATE OFFICIAL DELIVERABLES & RUN OFFICIAL VALIDATOR")
@@ -183,8 +205,8 @@ def main():
     matches_s2_file = PRED_DIR / "test_s1_s2_matches.parquet"
     matches_s3_file = PRED_DIR / "test_s1_s3_matches.parquet"
 
-    m_s2 = load_matches_map(matches_s2_file, "s2")
-    m_s3 = load_matches_map(matches_s3_file, "s3")
+    m_s2 = load_matches_map(matches_s2_file, "s2", top_margin=args.top_margin, max_matches=args.max_matches)
+    m_s3 = load_matches_map(matches_s3_file, "s3", top_margin=args.top_margin, max_matches=args.max_matches)
 
     # 3. Stream candidates
     cands_s2_file = BLOCKING_DIR / "test_s1_s2_candidates.parquet"
