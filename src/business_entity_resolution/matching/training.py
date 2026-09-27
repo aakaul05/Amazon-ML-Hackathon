@@ -122,3 +122,118 @@ def get_feature_importances(
         "importance": importances,
     }).sort_values(by="importance", ascending=False).reset_index(drop=True)
     return df
+
+
+try:
+    import lightgbm as lgb
+    LIGHTGBM_AVAILABLE = True
+except ImportError:
+    LIGHTGBM_AVAILABLE = False
+
+
+def create_lightgbm_matcher(
+    learning_rate: float = 0.05,
+    num_leaves: int = 63,
+    max_depth: int = 8,
+    min_child_samples: int = 50,
+    subsample: float = 0.8,
+    subsample_freq: int = 1,
+    colsample_bytree: float = 0.8,
+    reg_alpha: float = 0.0,
+    reg_lambda: float = 3.0,
+    thread_count: int = 8,
+    random_seed: int = 42,
+    verbose: int = -1,
+) -> Dict[str, Any]:
+    """
+    Returns a dictionary of LightGBM hyperparameters for binary pairwise entity matching.
+    """
+    return {
+        "objective": "binary",
+        "metric": ["binary_logloss", "auc"],
+        "boosting_type": "gbdt",
+        "learning_rate": learning_rate,
+        "num_leaves": num_leaves,
+        "max_depth": max_depth,
+        "min_child_samples": min_child_samples,
+        "subsample": subsample,
+        "subsample_freq": subsample_freq,
+        "colsample_bytree": colsample_bytree,
+        "reg_alpha": reg_alpha,
+        "reg_lambda": reg_lambda,
+        "n_jobs": thread_count,
+        "random_state": random_seed,
+        "verbose": verbose,
+    }
+
+
+def train_lightgbm_matcher(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    feature_names: List[str] = FEATURE_NAMES,
+    num_boost_round: int = 1500,
+    early_stopping_rounds: int = 100,
+    model_save_path: Optional[Path] = None,
+    verbose_eval: int = 200,
+    **lgb_kwargs,
+) -> Tuple[Any, Dict[str, Any]]:
+    """
+    Trains a LightGBM Booster on train features and evaluates against validation features.
+
+    Returns
+    -------
+    Tuple[lgb.Booster, Dict[str, Any]]
+        Trained Booster model and dictionary of evaluation metrics.
+    """
+    if not LIGHTGBM_AVAILABLE:
+        raise ImportError("LightGBM is not installed. Run 'pip install lightgbm'.")
+
+    params = create_lightgbm_matcher(**lgb_kwargs)
+
+    dtrain = lgb.Dataset(X_train, label=y_train, feature_name=feature_names)
+    dval = lgb.Dataset(X_val, label=y_val, reference=dtrain, feature_name=feature_names)
+
+    callbacks = [
+        lgb.early_stopping(stopping_rounds=early_stopping_rounds, verbose=False)
+    ]
+    if verbose_eval > 0:
+        callbacks.append(lgb.log_evaluation(period=verbose_eval))
+
+    booster = lgb.train(
+        params,
+        dtrain,
+        num_boost_round=num_boost_round,
+        valid_sets=[dval],
+        callbacks=callbacks,
+    )
+
+    if model_save_path is not None:
+        model_save_path = Path(model_save_path)
+        model_save_path.parent.mkdir(parents=True, exist_ok=True)
+        booster.save_model(str(model_save_path))
+
+    best_iter = booster.best_iteration if booster.best_iteration is not None else num_boost_round
+    best_score = booster.best_score if hasattr(booster, "best_score") else {}
+    metrics = {
+        "best_iteration": int(best_iter),
+        "best_score": best_score,
+    }
+    return booster, metrics
+
+
+def get_lightgbm_feature_importances(
+    booster: Any,
+    feature_names: List[str] = FEATURE_NAMES,
+    importance_type: str = "gain",
+) -> pd.DataFrame:
+    """
+    Returns a DataFrame of LightGBM feature importances sorted descending.
+    """
+    importances = booster.feature_importance(importance_type=importance_type)
+    df = pd.DataFrame({
+        "feature": feature_names,
+        "importance": importances,
+    }).sort_values(by="importance", ascending=False).reset_index(drop=True)
+    return df

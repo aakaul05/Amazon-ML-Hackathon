@@ -8,3 +8,4 @@ catboost
 pyarrow
 sparse-dot-topn
 faiss-cpu
+lightgbm

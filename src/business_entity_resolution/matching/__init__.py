@@ -17,6 +17,9 @@ from business_entity_resolution.matching.training import (
     create_catboost_matcher,
     train_catboost_matcher,
     get_feature_importances,
+    create_lightgbm_matcher,
+    train_lightgbm_matcher,
+    get_lightgbm_feature_importances,
 )
 from business_entity_resolution.matching.evaluation import (
     compute_entity_level_metrics,
@@ -36,6 +39,9 @@ __all__ = [
     "create_catboost_matcher",
     "train_catboost_matcher",
     "get_feature_importances",
+    "create_lightgbm_matcher",
+    "train_lightgbm_matcher",
+    "get_lightgbm_feature_importances",
     "compute_entity_level_metrics",
     "sweep_thresholds",
 ]
