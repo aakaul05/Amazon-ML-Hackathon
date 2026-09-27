@@ -458,6 +458,7 @@ def find_norm_file(norm_dir: Path, src: str) -> Path:
 def main():
     parser = argparse.ArgumentParser(description="Task 7: Test Blocking V3")
     parser.add_argument("--resume", action="store_true", default=True, help="Skip completed sources")
+    parser.add_argument("--overwrite", action="store_true", default=False, help="Overwrite existing candidate files")
     args = parser.parse_args()
 
     t_start = time.time()
@@ -475,7 +476,7 @@ def main():
 
     # 2. Process Source 2
     s2_out = BLOCKING_DIR / "test_s1_s2_candidates.parquet"
-    if args.resume and s2_out.is_file():
+    if not args.overwrite and args.resume and s2_out.is_file():
         print(f"\n[Source 2] Candidates already exist at {s2_out.name} (skipping)")
     else:
         print(f"\n[Source 2] Processing...")
@@ -489,7 +490,7 @@ def main():
 
     # 3. Process Source 3
     s3_out = BLOCKING_DIR / "test_s1_s3_candidates.parquet"
-    if args.resume and s3_out.is_file():
+    if not args.overwrite and args.resume and s3_out.is_file():
         print(f"\n[Source 3] Candidates already exist at {s3_out.name} (skipping)")
     else:
         print(f"\n[Source 3] Processing...")

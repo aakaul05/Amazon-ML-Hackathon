@@ -79,7 +79,30 @@ def check_models_exist() -> bool:
     return True
 
 
-def run_step(step_info: dict) -> bool:
+def backup_previous_outputs():
+    test_out = REPO_ROOT / "data" / "student_resource" / "outputs" / "test"
+    backup_dir = test_out / "backup_v1"
+    blocking_dir = test_out / "blocking"
+    preds_dir = test_out / "predictions"
+
+    if blocking_dir.is_dir():
+        for f in blocking_dir.glob("*.parquet"):
+            dest_dir = backup_dir / "blocking"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            if not (dest_dir / f.name).is_file():
+                print(f"Backing up previous {f.name} to {dest_dir.name}/...")
+                shutil.copy2(f, dest_dir / f.name)
+
+    if preds_dir.is_dir():
+        for f in preds_dir.glob("*.parquet"):
+            dest_dir = backup_dir / "predictions"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            if not (dest_dir / f.name).is_file():
+                print(f"Backing up previous {f.name} to {dest_dir.name}/...")
+                shutil.copy2(f, dest_dir / f.name)
+
+
+def run_step(step_info: dict, overwrite: bool = True) -> bool:
     step_num = step_info["step_num"]
     name = step_info["name"]
     desc = step_info["description"]
@@ -106,6 +129,9 @@ def run_step(step_info: dict) -> bool:
         return False
 
     cmd = [sys.executable, "-u", str(script_path)]
+    if step_num in (3, 4) and overwrite:
+        cmd.append("--overwrite")
+
     t0 = time.time()
     print(f"Executing: {' '.join(cmd)}")
     result = subprocess.run(cmd)
@@ -123,6 +149,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run V3 Blocking + LightGBM Test Pipeline")
     parser.add_argument("--start-from-step", type=int, default=1, choices=range(1, 6), help="Start from step (1-5)")
     parser.add_argument("--step", type=int, default=None, choices=range(1, 6), help="Run only specific step")
+    parser.add_argument("--overwrite", action="store_true", default=True, help="Overwrite previous V1 test outputs (backed up automatically)")
     args = parser.parse_args()
 
     t_all = time.time()
@@ -131,10 +158,13 @@ def main():
     print("TARGET SCORE: 0.92+ MACRO F0.5")
     print("=" * 80)
 
+    if args.overwrite:
+        backup_previous_outputs()
+
     steps_to_run = [s for s in PIPELINE_STEPS if args.step == s["step_num"]] if args.step else [s for s in PIPELINE_STEPS if s["step_num"] >= args.start_from_step]
 
     for step in steps_to_run:
-        success = run_step(step)
+        success = run_step(step, overwrite=args.overwrite)
         if not success:
             print(f"\nPipeline halted at Step {step['step_num']}.")
             sys.exit(1)

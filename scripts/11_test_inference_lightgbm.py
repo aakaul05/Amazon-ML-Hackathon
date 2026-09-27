@@ -131,13 +131,22 @@ def stream_inference_for_source(
     models: List[lgb.Booster],
     threshold: float,
     chunk_size: int = 500_000,
+    overwrite: bool = False,
 ) -> Path:
     final_matches_file = PRED_DIR / f"test_s1_{target_name}_matches.parquet"
-    if final_matches_file.is_file():
+    parts_dir = PRED_DIR / f"parts_s1_{target_name}_lgb"
+
+    if overwrite:
+        if final_matches_file.is_file():
+            final_matches_file.unlink()
+        if parts_dir.is_dir():
+            for p in parts_dir.glob("part_*.parquet"):
+                p.unlink()
+
+    if not overwrite and final_matches_file.is_file():
         print(f"\n[S1 -> {target_name.upper()}] Matches already generated -> {final_matches_file.name} (skipping)")
         return final_matches_file
 
-    parts_dir = PRED_DIR / f"parts_s1_{target_name}_lgb"
     parts_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'=' * 75}")
@@ -269,6 +278,7 @@ def main():
     parser = argparse.ArgumentParser(description="Streaming LightGBM Test Inference")
     parser.add_argument("--threshold", type=float, default=None, help="Inference threshold override")
     parser.add_argument("--chunk-size", type=int, default=500_000, help="Candidate chunk size")
+    parser.add_argument("--overwrite", action="store_true", default=False, help="Force re-inference on candidates")
     args = parser.parse_args()
 
     models_dir = find_models_dir()
@@ -317,13 +327,13 @@ def main():
 
     # 3. Stream inference for S2
     s2_cands = BLOCKING_DIR / "test_s1_s2_candidates.parquet"
-    stream_inference_for_source("s2", s2_cands, s1_lookup, s2_lookup, models, threshold, chunk_size=args.chunk_size)
+    stream_inference_for_source("s2", s2_cands, s1_lookup, s2_lookup, models, threshold, chunk_size=args.chunk_size, overwrite=args.overwrite)
     del s2_lookup
     gc.collect()
 
     # 4. Stream inference for S3
     s3_cands = BLOCKING_DIR / "test_s1_s3_candidates.parquet"
-    stream_inference_for_source("s3", s3_cands, s1_lookup, s3_lookup, models, threshold, chunk_size=args.chunk_size)
+    stream_inference_for_source("s3", s3_cands, s1_lookup, s3_lookup, models, threshold, chunk_size=args.chunk_size, overwrite=args.overwrite)
     del s1_lookup, s3_lookup
     gc.collect()
 
