@@ -9,7 +9,7 @@ Executes the 4 verified production pipeline steps in exact sequence:
   Step 2: python scripts/10_test_blocking.py
           - Runs 10 Task-7 blocking passes -> data/.../test/blocking/
   Step 3: python scripts/11_test_inference.py
-          - Streaming 30-feature computation + 5-fold CatBoost ensemble inference (threshold 0.98)
+          - Streaming 30-feature computation + 5-fold CatBoost ensemble inference (optimal threshold 0.95)
   Step 4: python scripts/12_create_submission.py
           - Aggregates deliverables to output/matching_results.tsv & output/candidate_pairs.tsv
           - Executes official submission validator
@@ -176,6 +176,8 @@ def main():
                         help="Step number to start from (default: 1)")
     parser.add_argument("--step", type=int, default=None, choices=[1, 2, 3, 4],
                         help="Run only this specific step")
+    parser.add_argument("--threshold", type=float, default=0.95,
+                        help="Matching decision threshold for Step 3 (default: 0.95)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Verify prerequisites and scripts without running")
     args = parser.parse_args()
@@ -222,6 +224,8 @@ def main():
 
         t0 = time.time()
         cmd = [sys.executable, "-u", str(s_script)]
+        if s_num == 3 and args.threshold is not None:
+            cmd.extend(["--threshold", str(args.threshold)])
         exit_code = run_command(cmd)
 
         elapsed_min = (time.time() - t0) / 60

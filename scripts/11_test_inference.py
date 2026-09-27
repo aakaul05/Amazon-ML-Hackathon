@@ -76,7 +76,7 @@ def find_models_dir() -> Path:
 
 
 MODELS_DIR = find_models_dir()
-FINAL_THRESHOLD = 0.9800000190734863
+FINAL_THRESHOLD = 0.95
 CHUNK_SIZE = 500_000
 
 
@@ -263,9 +263,19 @@ def stream_inference_for_source(
 
 
 def main():
+    global FINAL_THRESHOLD
+    import argparse
+    parser = argparse.ArgumentParser(description="Step 3: Test Inference")
+    parser.add_argument("--threshold", type=float, default=FINAL_THRESHOLD,
+                        help=f"Matching threshold (default: {FINAL_THRESHOLD})")
+    args, _ = parser.parse_known_args()
+    
+    FINAL_THRESHOLD = args.threshold
+    print(f"Using operational threshold: {FINAL_THRESHOLD:.4f}")
+
     start_all = time.time()
     print("=" * 75)
-    print("STEP 3: STREAMING 30-FEATURE INFERENCE (5-MODEL ENSEMBLE)")
+    print(f"STEP 3: STREAMING 30-FEATURE INFERENCE (5-MODEL ENSEMBLE, THRESHOLD={FINAL_THRESHOLD})")
     print("=" * 75)
 
     s1_norm_path = NORM_DIR / "s1_test_normalized.parquet"
